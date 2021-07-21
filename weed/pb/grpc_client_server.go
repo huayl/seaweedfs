@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,9 +25,15 @@ const (
 
 var (
 	// cache grpc connections
-	grpcClients     = make(map[string]*grpc.ClientConn)
+	grpcClients     = make(map[string]*versionedGrpcClient)
 	grpcClientsLock sync.Mutex
 )
+
+type versionedGrpcClient struct {
+	*grpc.ClientConn
+	version  int
+	errCount int
+}
 
 func init() {
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 1024
@@ -43,7 +50,7 @@ func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             60 * time.Second, // min time a client should wait before sending a ping
-			PermitWithoutStream: false,
+			PermitWithoutStream: true,
 		}),
 		grpc.MaxRecvMsgSize(Max_Message_Size),
 		grpc.MaxSendMsgSize(Max_Message_Size),
@@ -69,7 +76,7 @@ func GrpcDial(ctx context.Context, address string, opts ...grpc.DialOption) (*gr
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second, // client ping server if no activity for this long
 			Timeout:             20 * time.Second,
-			PermitWithoutStream: false,
+			PermitWithoutStream: true,
 		}))
 	for _, opt := range opts {
 		if opt != nil {
@@ -79,7 +86,7 @@ func GrpcDial(ctx context.Context, address string, opts ...grpc.DialOption) (*gr
 	return grpc.DialContext(ctx, address, options...)
 }
 
-func getOrCreateConnection(address string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+func getOrCreateConnection(address string, opts ...grpc.DialOption) (*versionedGrpcClient, error) {
 
 	grpcClientsLock.Lock()
 	defer grpcClientsLock.Unlock()
@@ -94,22 +101,54 @@ func getOrCreateConnection(address string, opts ...grpc.DialOption) (*grpc.Clien
 		return nil, fmt.Errorf("fail to dial %s: %v", address, err)
 	}
 
-	grpcClients[address] = grpcConnection
+	vgc := &versionedGrpcClient{
+		grpcConnection,
+		rand.Int(),
+		0,
+	}
+	grpcClients[address] = vgc
 
-	return grpcConnection, nil
+	return vgc, nil
 }
 
 func WithCachedGrpcClient(fn func(*grpc.ClientConn) error, address string, opts ...grpc.DialOption) error {
 
-	grpcConnection, err := getOrCreateConnection(address, opts...)
+	vgc, err := getOrCreateConnection(address, opts...)
 	if err != nil {
 		return fmt.Errorf("getOrCreateConnection %s: %v", address, err)
 	}
-	return fn(grpcConnection)
+	executionErr := fn(vgc.ClientConn)
+	if executionErr != nil {
+		vgc.errCount++
+		if vgc.errCount > 3 ||
+			strings.Contains(executionErr.Error(), "transport") ||
+			strings.Contains(executionErr.Error(), "connection closed") {
+			grpcClientsLock.Lock()
+			if t, ok := grpcClients[address]; ok {
+				if t.version == vgc.version {
+					vgc.Close()
+					delete(grpcClients, address)
+				}
+			}
+			grpcClientsLock.Unlock()
+		}
+	}
+
+	return executionErr
 }
 
 func ParseServerToGrpcAddress(server string) (serverGrpcAddress string, err error) {
 	return ParseServerAddress(server, 10000)
+}
+func ParseServersToGrpcAddresses(servers []string) (serverGrpcAddresses []string, err error) {
+	for _, server := range servers {
+		if serverGrpcAddress, parseErr := ParseServerToGrpcAddress(server); parseErr == nil {
+			serverGrpcAddresses = append(serverGrpcAddresses, serverGrpcAddress)
+		} else {
+			return nil, parseErr
+		}
+	}
+	return
 }
 
 func ParseServerAddress(server string, deltaPort int) (newServerAddress string, err error) {
@@ -201,4 +240,19 @@ func WithGrpcFilerClient(filerGrpcAddress string, grpcDialOption grpc.DialOption
 		return fn(client)
 	}, filerGrpcAddress, grpcDialOption)
 
+}
+
+func WithOneOfGrpcFilerClients(filerGrpcAddresses []string, grpcDialOption grpc.DialOption, fn func(client filer_pb.SeaweedFilerClient) error) (err error) {
+
+	for _, filerGrpcAddress := range filerGrpcAddresses {
+		err = WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+			client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+			return fn(client)
+		}, filerGrpcAddress, grpcDialOption)
+		if err == nil {
+			return nil
+		}
+	}
+
+	return err
 }

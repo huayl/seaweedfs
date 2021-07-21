@@ -51,13 +51,12 @@ type VolumeServerOptions struct {
 	indexType               *string
 	diskType                *string
 	fixJpgOrientation       *bool
-	readRedirect            *bool
+	readMode                *string
 	cpuProfile              *string
 	memProfile              *string
 	compactionMBPerSecond   *int
 	fileSizeLimitMB         *int
 	concurrentUploadLimitMB *int
-	minFreeSpacePercents    []float32
 	pprof                   *bool
 	preStopSeconds          *int
 	metricsHttpPort         *int
@@ -81,7 +80,7 @@ func init() {
 	v.indexType = cmdVolume.Flag.String("index", "memory", "Choose [memory|leveldb|leveldbMedium|leveldbLarge] mode for memory~performance balance.")
 	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	v.fixJpgOrientation = cmdVolume.Flag.Bool("images.fix.orientation", false, "Adjust jpg orientation when uploading.")
-	v.readRedirect = cmdVolume.Flag.Bool("read.redirect", true, "Redirect moved or non-local volumes.")
+	v.readMode = cmdVolume.Flag.String("readMode", "proxy", "[local|proxy|redirect] how to deal with non-local volume: 'not found|proxy to remote node|redirect volume location'.")
 	v.cpuProfile = cmdVolume.Flag.String("cpuprofile", "", "cpu profile output file")
 	v.memProfile = cmdVolume.Flag.String("memprofile", "", "memory profile output file")
 	v.compactionMBPerSecond = cmdVolume.Flag.Int("compactionMBps", 0, "limit background compaction or copying speed in mega bytes per second")
@@ -105,7 +104,8 @@ var (
 	volumeFolders         = cmdVolume.Flag.String("dir", os.TempDir(), "directories to store data files. dir[,dir]...")
 	maxVolumeCounts       = cmdVolume.Flag.String("max", "8", "maximum numbers of volumes, count[,count]... If set to zero, the limit will be auto configured.")
 	volumeWhiteListOption = cmdVolume.Flag.String("whiteList", "", "comma separated Ip addresses having write permission. No limit if empty.")
-	minFreeSpacePercent   = cmdVolume.Flag.String("minFreeSpacePercent", "1", "minimum free disk space (default to 1%). Low disk space will mark all volumes as ReadOnly.")
+	minFreeSpacePercent   = cmdVolume.Flag.String("minFreeSpacePercent", "1", "minimum free disk space (default to 1%). Low disk space will mark all volumes as ReadOnly (deprecated, use minFreeSpace instead).")
+	minFreeSpace          = cmdVolume.Flag.String("minFreeSpace", "", "min free disk space (value<=100 as percentage like 1, other as human readable bytes, like 10GiB). Low disk space will mark all volumes as ReadOnly.")
 )
 
 func runVolume(cmd *Command, args []string) bool {
@@ -120,12 +120,13 @@ func runVolume(cmd *Command, args []string) bool {
 
 	go stats_collect.StartMetricsServer(*v.metricsHttpPort)
 
-	v.startVolumeServer(*volumeFolders, *maxVolumeCounts, *volumeWhiteListOption, *minFreeSpacePercent)
+	minFreeSpaces := util.MustParseMinFreeSpace(*minFreeSpace, *minFreeSpacePercent)
+	v.startVolumeServer(*volumeFolders, *maxVolumeCounts, *volumeWhiteListOption, minFreeSpaces)
 
 	return true
 }
 
-func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption, minFreeSpacePercent string) {
+func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption string, minFreeSpaces []util.MinFreeSpace) {
 
 	// Set multiple folders and each folder's max volume count limit'
 	v.folders = strings.Split(volumeFolders, ",")
@@ -153,22 +154,13 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		glog.Fatalf("%d directories by -dir, but only %d max is set by -max", len(v.folders), len(v.folderMaxLimits))
 	}
 
-	// set minFreeSpacePercent
-	minFreeSpacePercentStrings := strings.Split(minFreeSpacePercent, ",")
-	for _, freeString := range minFreeSpacePercentStrings {
-		if value, e := strconv.ParseFloat(freeString, 32); e == nil {
-			v.minFreeSpacePercents = append(v.minFreeSpacePercents, float32(value))
-		} else {
-			glog.Fatalf("The value specified in -minFreeSpacePercent not a valid value %s", freeString)
-		}
-	}
-	if len(v.minFreeSpacePercents) == 1 && len(v.folders) > 1 {
+	if len(minFreeSpaces) == 1 && len(v.folders) > 1 {
 		for i := 0; i < len(v.folders)-1; i++ {
-			v.minFreeSpacePercents = append(v.minFreeSpacePercents, v.minFreeSpacePercents[0])
+			minFreeSpaces = append(minFreeSpaces, minFreeSpaces[0])
 		}
 	}
-	if len(v.folders) != len(v.minFreeSpacePercents) {
-		glog.Fatalf("%d directories by -dir, but only %d minFreeSpacePercent is set by -minFreeSpacePercent", len(v.folders), len(v.minFreeSpacePercents))
+	if len(v.folders) != len(minFreeSpaces) {
+		glog.Fatalf("%d directories by -dir, but only %d minFreeSpacePercent is set by -minFreeSpacePercent", len(v.folders), len(minFreeSpaces))
 	}
 
 	// set disk types
@@ -231,12 +223,12 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
 		*v.ip, *v.port, *v.publicUrl,
-		v.folders, v.folderMaxLimits, v.minFreeSpacePercents, diskTypes,
+		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes,
 		*v.idxFolder,
 		volumeNeedleMapKind,
 		strings.Split(masters, ","), 5, *v.dataCenter, *v.rack,
 		v.whiteList,
-		*v.fixJpgOrientation, *v.readRedirect,
+		*v.fixJpgOrientation, *v.readMode,
 		*v.compactionMBPerSecond,
 		*v.fileSizeLimitMB,
 		int64(*v.concurrentUploadLimitMB)*1024*1024,
@@ -267,6 +259,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 
 		// Stop heartbeats
 		if !volumeServer.StopHeartbeat() {
+			volumeServer.SetStopping()
 			glog.V(0).Infof("stop send heartbeat and wait %d seconds until shutdown ...", *v.preStopSeconds)
 			time.Sleep(time.Duration(*v.preStopSeconds) * time.Second)
 		}

@@ -5,7 +5,9 @@ all: gen
 gen: dev
 
 binary:
-	cd ../weed; CGO_ENABLED=0 GOOS=linux go build -ldflags "-extldflags -static"; mv weed ../docker/
+	export SWCOMMIT=$(shell git rev-parse --short HEAD)
+	export SWLDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(SWCOMMIT)"
+	cd ../weed; CGO_ENABLED=0 GOOS=linux go build -ldflags "-extldflags -static $(SWLDFLAGS)"; mv weed ../docker/
 
 build: binary
 	docker build --no-cache -t chrislusf/seaweedfs:local -f Dockerfile.local .
@@ -22,6 +24,9 @@ dev_tls: build certstrap
 
 dev_mount: build
 	docker-compose -f compose/local-mount-compose.yml -p seaweedfs up
+
+run_image: build
+	docker run --rm -ti --device /dev/fuse --cap-add SYS_ADMIN --entrypoint /bin/sh chrislusf/seaweedfs:local
 
 profile_mount: build
 	docker-compose -f compose/local-mount-profile-compose.yml -p seaweedfs up

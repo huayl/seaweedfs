@@ -29,7 +29,7 @@ type Dir struct {
 
 var _ = fs.Node(&Dir{})
 
-//var _ = fs.NodeIdentifier(&Dir{})
+var _ = fs.NodeIdentifier(&Dir{})
 var _ = fs.NodeCreater(&Dir{})
 var _ = fs.NodeMknoder(&Dir{})
 var _ = fs.NodeMkdirer(&Dir{})
@@ -45,33 +45,35 @@ var _ = fs.NodeRemovexattrer(&Dir{})
 var _ = fs.NodeListxattrer(&Dir{})
 var _ = fs.NodeForgetter(&Dir{})
 
-func (dir *Dir) xId() uint64 {
+func (dir *Dir) Id() uint64 {
+	if dir.parent == nil {
+		return 1
+	}
 	return dir.id
 }
 
 func (dir *Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
 
-	// https://github.com/bazil/fuse/issues/196
-	attr.Valid = time.Second
-
-	if dir.FullPath() == dir.wfs.option.FilerMountRootPath {
-		dir.setRootDirAttributes(attr)
-		glog.V(3).Infof("root dir Attr %s, attr: %+v", dir.FullPath(), attr)
-		return nil
-	}
-
 	entry, err := dir.maybeLoadEntry()
 	if err != nil {
-		glog.V(3).Infof("dir Attr %s,err: %+v", dir.FullPath(), err)
+		glog.V(3).Infof("dir Attr %s, err: %+v", dir.FullPath(), err)
 		return err
 	}
 
-	// attr.Inode = dir.Id()
+	// https://github.com/bazil/fuse/issues/196
+	attr.Valid = time.Second
+	attr.Inode = dir.Id()
 	attr.Mode = os.FileMode(entry.Attributes.FileMode) | os.ModeDir
 	attr.Mtime = time.Unix(entry.Attributes.Mtime, 0)
 	attr.Crtime = time.Unix(entry.Attributes.Crtime, 0)
+	attr.Ctime = time.Unix(entry.Attributes.Crtime, 0)
+	attr.Atime = time.Unix(entry.Attributes.Mtime, 0)
 	attr.Gid = entry.Attributes.Gid
 	attr.Uid = entry.Attributes.Uid
+
+	if dir.FullPath() == dir.wfs.option.FilerMountRootPath {
+		attr.BlockSize = blockSize
+	}
 
 	glog.V(4).Infof("dir Attr %s, attr: %+v", dir.FullPath(), attr)
 
@@ -88,20 +90,6 @@ func (dir *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *f
 	}
 
 	return getxattr(entry, req, resp)
-}
-
-func (dir *Dir) setRootDirAttributes(attr *fuse.Attr) {
-	// attr.Inode = 1 // filer2.FullPath(dir.Path).AsInode()
-	attr.Valid = time.Second
-	attr.Inode = 1 // dir.Id()
-	attr.Uid = dir.wfs.option.MountUid
-	attr.Gid = dir.wfs.option.MountGid
-	attr.Mode = dir.wfs.option.MountMode
-	attr.Crtime = dir.wfs.option.MountCtime
-	attr.Ctime = dir.wfs.option.MountCtime
-	attr.Mtime = dir.wfs.option.MountMtime
-	attr.Atime = dir.wfs.option.MountMtime
-	attr.BlockSize = blockSize
 }
 
 func (dir *Dir) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
@@ -153,7 +141,7 @@ func (dir *Dir) Create(ctx context.Context, req *fuse.CreateRequest,
 	var node fs.Node
 	if isDirectory {
 		node = dir.newDirectory(util.NewFullPath(dir.FullPath(), req.Name))
-		return node, nil, nil
+		return node, node, nil
 	}
 
 	node = dir.newFile(req.Name)
@@ -173,7 +161,7 @@ func (dir *Dir) Create(ctx context.Context, req *fuse.CreateRequest,
 		},
 	}
 	file.dirtyMetadata = true
-	fh := dir.wfs.AcquireHandle(file, req.Uid, req.Gid)
+	fh := dir.wfs.AcquireHandle(file, req.Uid, req.Gid, req.Flags&fuse.OpenWriteOnly > 0)
 	return file, fh, nil
 
 }
@@ -293,7 +281,7 @@ func (dir *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, err
 func (dir *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (node fs.Node, err error) {
 
 	dirPath := util.FullPath(dir.FullPath())
-	glog.V(4).Infof("dir Lookup %s: %s by %s", dirPath, req.Name, req.Header.String())
+	// glog.V(4).Infof("dir Lookup %s: %s by %s", dirPath, req.Name, req.Header.String())
 
 	fullFilePath := dirPath.Child(req.Name)
 	visitErr := meta_cache.EnsureVisited(dir.wfs.metaCache, dir.wfs, dirPath)
@@ -328,6 +316,7 @@ func (dir *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 		// resp.EntryValid = time.Second
 		resp.Attr.Inode = fullFilePath.AsInode()
 		resp.Attr.Valid = time.Second
+		resp.Attr.Size = localEntry.FileSize
 		resp.Attr.Mtime = localEntry.Attr.Mtime
 		resp.Attr.Crtime = localEntry.Attr.Crtime
 		resp.Attr.Mode = localEntry.Attr.Mode
@@ -371,6 +360,28 @@ func (dir *Dir) ReadDirAll(ctx context.Context) (ret []fuse.Dirent, err error) {
 		glog.Errorf("list meta cache: %v", listErr)
 		return nil, fuse.EIO
 	}
+
+	// create proper . and .. directories
+	ret = append(ret, fuse.Dirent{
+		Inode: dirPath.AsInode(),
+		Name:  ".",
+		Type:  fuse.DT_Dir,
+	})
+
+	// return the correct parent inode for the mount root
+	var inode uint64
+	if string(dirPath) == dir.wfs.option.FilerMountRootPath {
+		inode = dir.wfs.option.MountParentInode
+	} else {
+		inode = util.FullPath(dir.parent.FullPath()).AsInode()
+	}
+
+	ret = append(ret, fuse.Dirent{
+		Inode: inode,
+		Name:  "..",
+		Type:  fuse.DT_Dir,
+	})
+
 	return
 }
 
@@ -432,7 +443,10 @@ func (dir *Dir) removeOneFile(req *fuse.RemoveRequest) error {
 	dir.wfs.handlesLock.Lock()
 	defer dir.wfs.handlesLock.Unlock()
 	inodeId := filePath.AsInode()
-	delete(dir.wfs.handles, inodeId)
+	if fh, ok := dir.wfs.handles[inodeId]; ok {
+		delete(dir.wfs.handles, inodeId)
+		fh.isDeleted = true
+	}
 
 	return nil
 

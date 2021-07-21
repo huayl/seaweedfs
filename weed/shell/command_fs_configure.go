@@ -30,17 +30,17 @@ func (c *commandFsConfigure) Help() string {
 	fs.configure
 
 	# trying the changes and see the possible configuration file content
-	fs.configure -locationPrfix=/my/folder -collection=abc
-	fs.configure -locationPrfix=/my/folder -collection=abc -ttl=7d
+	fs.configure -locationPrefix=/my/folder -collection=abc
+	fs.configure -locationPrefix=/my/folder -collection=abc -ttl=7d
 
 	# example: configure adding only 1 physical volume for each bucket collection
-	fs.configure -locationPrfix=/buckets/ -volumeGrowthCount=1
+	fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1
 
 	# apply the changes
-	fs.configure -locationPrfix=/my/folder -collection=abc -apply
+	fs.configure -locationPrefix=/my/folder -collection=abc -apply
 
 	# delete the changes
-	fs.configure -locationPrfix=/my/folder -delete -apply
+	fs.configure -locationPrefix=/my/folder -delete -apply
 
 `
 }
@@ -54,6 +54,7 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	ttl := fsConfigureCommand.String("ttl", "", "assign writes with this ttl")
 	diskType := fsConfigureCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	fsync := fsConfigureCommand.Bool("fsync", false, "fsync for the writes")
+	isReadOnly := fsConfigureCommand.Bool("readOnly", false, "disable writes")
 	volumeGrowthCount := fsConfigureCommand.Int("volumeGrowthCount", 0, "the number of physical volumes to add if no writable volumes")
 	isDelete := fsConfigureCommand.Bool("delete", false, "delete the configuration by locationPrefix")
 	apply := fsConfigureCommand.Bool("apply", false, "update and apply filer configuration")
@@ -84,6 +85,7 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			Fsync:             *fsync,
 			DiskType:          *diskType,
 			VolumeGrowthCount: uint32(*volumeGrowthCount),
+			ReadOnly:          *isReadOnly,
 		}
 
 		// check collection
@@ -118,7 +120,9 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 
 	if *apply {
 
-		if err := filer.SaveAs(commandEnv.option.FilerHost, int(commandEnv.option.FilerPort), filer.DirectoryEtcSeaweedFS, filer.FilerConfName, "text/plain; charset=utf-8", &buf); err != nil {
+		if err = commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+			return filer.SaveInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
+		}); err != nil && err != filer_pb.ErrNotFound {
 			return err
 		}
 

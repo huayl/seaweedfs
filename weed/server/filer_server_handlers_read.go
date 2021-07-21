@@ -21,7 +21,7 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
-func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, isGetMethod bool) {
+func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 	isForDirectory := strings.HasSuffix(path, "/")
@@ -40,7 +40,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 			stats.FilerRequestCounter.WithLabelValues("read.notfound").Inc()
 			w.WriteHeader(http.StatusNotFound)
 		} else {
-			glog.V(0).Infof("Internal %s: %v", path, err)
+			glog.Errorf("Internal %s: %v", path, err)
 			stats.FilerRequestCounter.WithLabelValues("read.internalerror").Inc()
 			w.WriteHeader(http.StatusInternalServerError)
 		}
@@ -58,6 +58,13 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 
 	if isForDirectory {
 		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// set etag
+	etag := filer.ETagEntry(entry)
+	if ifm := r.Header.Get("If-Match"); ifm != "" && ifm != "\""+etag+"\"" {
+		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 
@@ -115,8 +122,6 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// set etag
-	etag := filer.ETagEntry(entry)
 	if inm := r.Header.Get("If-None-Match"); inm == "\""+etag+"\"" {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -131,9 +136,6 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 
 	if r.Method == "HEAD" {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
-		processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
-			return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size, true)
-		})
 		return
 	}
 
@@ -161,7 +163,10 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 			}
 			return err
 		}
-		return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size, false)
+		err = filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size)
+		if err != nil {
+			glog.Errorf("failed to stream content %s: %v", r.URL, err)
+		}
+		return err
 	})
-
 }

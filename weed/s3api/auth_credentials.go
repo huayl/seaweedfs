@@ -3,14 +3,16 @@ package s3api
 import (
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/s3api/s3_constants"
-	"io/ioutil"
-	"net/http"
-
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/pb"
+	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/iam_pb"
 	xhttp "github.com/chrislusf/seaweedfs/weed/s3api/http"
+	"github.com/chrislusf/seaweedfs/weed/s3api/s3_constants"
 	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
+	"io/ioutil"
+	"net/http"
+	"strings"
 )
 
 type Action string
@@ -51,8 +53,12 @@ func NewIdentityAccessManagement(option *S3ApiServerOption) *IdentityAccessManag
 	return iam
 }
 
-func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFiler(option *S3ApiServerOption) error {
-	content, err := filer.ReadContent(option.Filer, filer.IamConfigDirecotry, filer.IamIdentityFile)
+func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFiler(option *S3ApiServerOption) (err error) {
+	var content []byte
+	err = pb.WithFilerClient(option.Filer, option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		content, err = filer.ReadInsideFiler(client, filer.IamConfigDirecotry, filer.IamIdentityFile)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("read S3 config: %v", err)
 	}
@@ -150,7 +156,7 @@ func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) htt
 			f(w, r)
 			return
 		}
-		writeErrorResponse(w, errCode, r.URL)
+		s3err.WriteErrorResponse(w, errCode, r)
 	}
 }
 
@@ -190,7 +196,7 @@ func (iam *IdentityAccessManagement) authRequest(r *http.Request, action Action)
 		return identity, s3Err
 	}
 
-	glog.V(3).Infof("user name: %v actions: %v", identity.Name, identity.Actions)
+	glog.V(3).Infof("user name: %v actions: %v, action: %v", identity.Name, identity.Actions, action)
 
 	bucket, _ := getBucketAndObject(r)
 
@@ -255,11 +261,21 @@ func (identity *Identity) canDo(action Action, bucket string) bool {
 	limitedByBucket := string(action) + ":" + bucket
 	adminLimitedByBucket := s3_constants.ACTION_ADMIN + ":" + bucket
 	for _, a := range identity.Actions {
-		if string(a) == limitedByBucket {
-			return true
-		}
-		if string(a) == adminLimitedByBucket {
-			return true
+		act := string(a)
+		if strings.HasSuffix(act, "*") {
+			if strings.HasPrefix(limitedByBucket, act[:len(act)-1]) {
+				return true
+			}
+			if strings.HasPrefix(adminLimitedByBucket, act[:len(act)-1]) {
+				return true
+			}
+		} else {
+			if act == limitedByBucket {
+				return true
+			}
+			if act == adminLimitedByBucket {
+				return true
+			}
 		}
 	}
 	return false

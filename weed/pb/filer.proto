@@ -101,6 +101,13 @@ message Entry {
     bytes hard_link_id = 7;
     int32 hard_link_counter = 8; // only exists in hard link meta data
     bytes content = 9; // if not empty, the file content
+
+    message Remote {
+        int64 last_modified_at = 1;
+        int64 size = 2;
+        string e_tag = 3;
+    }
+    Remote remote = 10;
 }
 
 message FullEntry {
@@ -208,6 +215,7 @@ message AtomicRenameEntryRequest {
     string old_name = 2;
     string new_directory = 3;
     string new_name = 4;
+    repeated int32 signatures = 5;
 }
 
 message AtomicRenameEntryResponse {
@@ -292,6 +300,7 @@ message GetFilerConfigurationResponse {
     int32 signature = 8;
     string metrics_address = 9;
     int32 metrics_interval_sec = 10;
+    string version = 11;
 }
 
 message SubscribeMetadataRequest {
@@ -361,6 +370,16 @@ message FilerConf {
         string disk_type = 5;
         bool fsync = 6;
         uint32 volume_growth_count = 7;
+        bool read_only = 8;
     }
     repeated PathConf locations = 2;
+}
+
+message RemoteConf {
+    string type = 1;
+    string name = 2;
+    string s3_access_key = 4;
+    string s3_secret_key = 5;
+    string s3_region = 6;
+    string s3_endpoint = 7;
 }

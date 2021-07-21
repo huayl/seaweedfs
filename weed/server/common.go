@@ -1,10 +1,12 @@
 package weed_server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
@@ -21,19 +23,14 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/util"
 
 	"github.com/gorilla/mux"
-	statik "github.com/rakyll/statik/fs"
-
-	_ "github.com/chrislusf/seaweedfs/weed/statik"
 )
 
 var serverStats *stats.ServerStats
 var startTime = time.Now()
-var statikFS http.FileSystem
 
 func init() {
 	serverStats = stats.NewServerStats()
 	go serverStats.Start()
-	statikFS, _ = statik.New()
 }
 
 func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) (err error) {
@@ -108,7 +105,9 @@ func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn ope
 	}
 
 	debug("parsing upload file...")
-	pu, pe := needle.ParseUpload(r, 256*1024*1024)
+	bytesBuffer := bufPool.Get().(*bytes.Buffer)
+	defer bufPool.Put(bytesBuffer)
+	pu, pe := needle.ParseUpload(r, 256*1024*1024, bytesBuffer)
 	if pe != nil {
 		writeJsonError(w, r, http.StatusBadRequest, pe)
 		return
@@ -212,14 +211,16 @@ func statsMemoryHandler(w http.ResponseWriter, r *http.Request) {
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
 
+var StaticFS fs.FS
+
 func handleStaticResources(defaultMux *http.ServeMux) {
-	defaultMux.Handle("/favicon.ico", http.FileServer(statikFS))
-	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(statikFS)))
+	defaultMux.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
 func handleStaticResources2(r *mux.Router) {
-	r.Handle("/favicon.ico", http.FileServer(statikFS))
-	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(statikFS)))
+	r.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
 func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, filename string) {
@@ -279,6 +280,7 @@ func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 		w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
 		w.Header().Set("Content-Range", ra.contentRange(totalSize))
 
+		w.WriteHeader(http.StatusPartialContent)
 		err = writeFn(w, ra.start, ra.length)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

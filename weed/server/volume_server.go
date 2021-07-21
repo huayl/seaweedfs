@@ -17,6 +17,10 @@ import (
 )
 
 type VolumeServer struct {
+	inFlightDataSize      int64
+	concurrentUploadLimit int64
+	inFlightDataLimitCond *sync.Cond
+
 	SeedMasterNodes []string
 	currentMaster   string
 	pulseSeconds    int
@@ -28,29 +32,25 @@ type VolumeServer struct {
 
 	needleMapKind           storage.NeedleMapKind
 	FixJpgOrientation       bool
-	ReadRedirect            bool
+	ReadMode                string
 	compactionBytePerSecond int64
 	metricsAddress          string
 	metricsIntervalSec      int
 	fileSizeLimitBytes      int64
 	isHeartbeating          bool
 	stopChan                chan bool
-
-	inFlightDataSize      int64
-	inFlightDataLimitCond *sync.Cond
-	concurrentUploadLimit int64
 }
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	port int, publicUrl string,
-	folders []string, maxCounts []int, minFreeSpacePercents []float32, diskTypes []types.DiskType,
+	folders []string, maxCounts []int, minFreeSpaces []util.MinFreeSpace, diskTypes []types.DiskType,
 	idxFolder string,
 	needleMapKind storage.NeedleMapKind,
 	masterNodes []string, pulseSeconds int,
 	dataCenter string, rack string,
 	whiteList []string,
 	fixJpgOrientation bool,
-	readRedirect bool,
+	readMode string,
 	compactionMBPerSecond int,
 	fileSizeLimitMB int,
 	concurrentUploadLimit int64,
@@ -72,7 +72,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		rack:                    rack,
 		needleMapKind:           needleMapKind,
 		FixJpgOrientation:       fixJpgOrientation,
-		ReadRedirect:            readRedirect,
+		ReadMode:                readMode,
 		grpcDialOption:          security.LoadClientTLS(util.GetViper(), "grpc.volume"),
 		compactionBytePerSecond: int64(compactionMBPerSecond) * 1024 * 1024,
 		fileSizeLimitBytes:      int64(fileSizeLimitMB) * 1024 * 1024,
@@ -85,7 +85,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 
 	vs.checkWithMaster()
 
-	vs.store = storage.NewStore(vs.grpcDialOption, port, ip, publicUrl, folders, maxCounts, minFreeSpacePercents, idxFolder, vs.needleMapKind, diskTypes)
+	vs.store = storage.NewStore(vs.grpcDialOption, port, ip, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes)
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)
@@ -110,6 +110,11 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	go stats.LoopPushingMetric("volumeServer", fmt.Sprintf("%s:%d", ip, port), vs.metricsAddress, vs.metricsIntervalSec)
 
 	return vs
+}
+
+func (vs *VolumeServer) SetStopping() {
+	glog.V(0).Infoln("Stopping volume server...")
+	vs.store.SetStopping()
 }
 
 func (vs *VolumeServer) Shutdown() {

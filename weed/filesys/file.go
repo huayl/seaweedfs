@@ -83,7 +83,7 @@ func (file *File) Attr(ctx context.Context, attr *fuse.Attr) (err error) {
 
 func (file *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 
-	glog.V(4).Infof("file Getxattr %s", file.fullpath())
+	// glog.V(4).Infof("file Getxattr %s", file.fullpath())
 
 	entry, err := file.maybeLoadEntry(ctx)
 	if err != nil {
@@ -97,7 +97,7 @@ func (file *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Op
 
 	glog.V(4).Infof("file %v open %+v", file.fullpath(), req)
 
-	handle := file.wfs.AcquireHandle(file, req.Uid, req.Gid)
+	handle := file.wfs.AcquireHandle(file, req.Uid, req.Gid, req.Flags&fuse.OpenWriteOnly > 0)
 
 	resp.Handle = fuse.HandleID(handle.handle)
 
@@ -114,16 +114,6 @@ func (file *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *f
 	entry, err := file.maybeLoadEntry(ctx)
 	if err != nil {
 		return err
-	}
-	if file.isOpen > 0 {
-		file.wfs.handlesLock.Lock()
-		fileHandle := file.wfs.handles[file.Id()]
-		file.wfs.handlesLock.Unlock()
-
-		if fileHandle != nil {
-			fileHandle.Lock()
-			defer fileHandle.Unlock()
-		}
 	}
 
 	if req.Valid.Size() {
@@ -154,17 +144,17 @@ func (file *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *f
 		file.dirtyMetadata = true
 	}
 
-	if req.Valid.Mode() {
+	if req.Valid.Mode() && entry.Attributes.FileMode != uint32(req.Mode) {
 		entry.Attributes.FileMode = uint32(req.Mode)
 		file.dirtyMetadata = true
 	}
 
-	if req.Valid.Uid() {
+	if req.Valid.Uid() && entry.Attributes.Uid != req.Uid {
 		entry.Attributes.Uid = req.Uid
 		file.dirtyMetadata = true
 	}
 
-	if req.Valid.Gid() {
+	if req.Valid.Gid() && entry.Attributes.Gid != req.Gid {
 		entry.Attributes.Gid = req.Gid
 		file.dirtyMetadata = true
 	}
@@ -174,7 +164,7 @@ func (file *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *f
 		file.dirtyMetadata = true
 	}
 
-	if req.Valid.Mtime() {
+	if req.Valid.Mtime() && entry.Attributes.Mtime != req.Mtime.Unix() {
 		entry.Attributes.Mtime = req.Mtime.Unix()
 		file.dirtyMetadata = true
 	}
@@ -207,6 +197,11 @@ func (file *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error
 	if err := setxattr(entry, req); err != nil {
 		return err
 	}
+	file.dirtyMetadata = true
+
+	if file.isOpen > 0 {
+		return nil
+	}
 
 	return file.saveEntry(entry)
 
@@ -223,6 +218,11 @@ func (file *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest)
 
 	if err := removexattr(entry, req); err != nil {
 		return err
+	}
+	file.dirtyMetadata = true
+
+	if file.isOpen > 0 {
+		return nil
 	}
 
 	return file.saveEntry(entry)
@@ -267,7 +267,7 @@ func (file *File) maybeLoadEntry(ctx context.Context) (entry *filer_pb.Entry, er
 	file.wfs.handlesLock.Unlock()
 	entry = file.entry
 	if found {
-		glog.V(4).Infof("maybeLoadEntry found opened file %s/%s: %v %v", file.dir.FullPath(), file.Name, handle.f.entry, entry)
+		// glog.V(4).Infof("maybeLoadEntry found opened file %s/%s", file.dir.FullPath(), file.Name)
 		entry = handle.f.entry
 	}
 
@@ -336,20 +336,22 @@ func (file *File) saveEntry(entry *filer_pb.Entry) error {
 		file.wfs.mapPbIdFromLocalToFiler(entry)
 		defer file.wfs.mapPbIdFromFilerToLocal(entry)
 
-		request := &filer_pb.UpdateEntryRequest{
+		request := &filer_pb.CreateEntryRequest{
 			Directory:  file.dir.FullPath(),
 			Entry:      entry,
 			Signatures: []int32{file.wfs.signature},
 		}
 
 		glog.V(4).Infof("save file entry: %v", request)
-		_, err := client.UpdateEntry(context.Background(), request)
+		_, err := client.CreateEntry(context.Background(), request)
 		if err != nil {
 			glog.Errorf("UpdateEntry file %s/%s: %v", file.dir.FullPath(), file.Name, err)
 			return fuse.EIO
 		}
 
-		file.wfs.metaCache.UpdateEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry))
+		file.wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry))
+
+		file.dirtyMetadata = false
 
 		return nil
 	})
