@@ -1,110 +1,88 @@
-// +build linux darwin freebsd
+//go:build linux || darwin || freebsd
 
 package command
 
 import (
-	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"net"
 	"os"
 	"os/user"
-	"path"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
+	"syscall"
 
-	"github.com/chrislusf/seaweedfs/weed/filesys/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
-	"github.com/seaweedfs/fuse"
-	"github.com/seaweedfs/fuse/fs"
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/mount/unmount"
 
-	"github.com/chrislusf/seaweedfs/weed/filesys"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/chrislusf/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
-func runMount(cmd *Command, args []string) bool {
-
-	grace.SetupProfiling(*mountCpuProfile, *mountMemProfile)
-	if *mountReadRetryTime < time.Second {
-		*mountReadRetryTime = time.Second
-	}
-	util.RetryWaitTime = *mountReadRetryTime
-
-	umask, umaskErr := strconv.ParseUint(*mountOptions.umaskString, 8, 64)
-	if umaskErr != nil {
-		fmt.Printf("can not parse umask %s", *mountOptions.umaskString)
-		return false
-	}
-
-	if len(args) > 0 {
-		return false
-	}
-
-	return RunMount(&mountOptions, os.FileMode(umask))
-}
-
 func RunMount(option *MountOptions, umask os.FileMode) bool {
-
-	filer := *option.filer
-	// parse filer grpc address
-	filerGrpcAddress, err := pb.ParseServerToGrpcAddress(filer)
-	if err != nil {
-		glog.V(0).Infof("ParseFilerGrpcAddress: %v", err)
-		return true
+	if err := configureMountMemory(option); err != nil {
+		fmt.Println(err)
+		return false
 	}
 
-	util.LoadConfiguration("security", false)
-	// try to connect to filer, filerBucketsPath may be useful later
-	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
-	var cipher bool
-	for i := 0; i < 10; i++ {
-		err = pb.WithGrpcFilerClient(filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
-			if err != nil {
-				return fmt.Errorf("get filer grpc address %s configuration: %v", filerGrpcAddress, err)
-			}
-			cipher = resp.Cipher
-			return nil
-		})
-		if err != nil {
-			glog.V(0).Infof("failed to talk to filer %s: %v", filerGrpcAddress, err)
-			glog.V(0).Infof("wait for %d seconds ...", i+1)
-			time.Sleep(time.Duration(i+1) * time.Second)
-		}
+	// basic checks
+	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
+	if chunkSizeLimitMB <= 0 {
+		fmt.Printf("Please specify a reasonable buffer size.\n")
+		return false
 	}
-	if err != nil {
-		glog.Errorf("failed to talk to filer %s: %v", filerGrpcAddress, err)
+
+	filerAddresses, grpcDialOption, cipher, bucketRootPath, ok := connectToFiler(option)
+	if !ok {
 		return true
 	}
 
 	filerMountRootPath := *option.filerMountRootPath
-	dir := util.ResolvePath(*option.dir)
-	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
 
-	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.Version(), runtime.GOOS, runtime.GOARCH)
+	// clean up mount point
+	dir := util.ResolvePath(*option.dir)
 	if dir == "" {
 		fmt.Printf("Please specify the mount directory via \"-dir\"")
 		return false
 	}
-	if chunkSizeLimitMB <= 0 {
-		fmt.Printf("Please specify a reasonable buffer size.")
-		return false
+
+	if err := unmount.Unmount(dir); err != nil {
+		glog.V(1).Infof("pre-mount cleanup unmount %s: %v", dir, err)
 	}
 
-	fuse.Unmount(dir)
+	// start on local unix socket
+	if *option.localSocket == "" {
+		mountDirHash := util.HashToInt32([]byte(dir))
+		if mountDirHash < 0 {
+			mountDirHash = -mountDirHash
+		}
+		*option.localSocket = fmt.Sprintf("/tmp/seaweedfs-mount-%d.sock", mountDirHash)
+	}
+	if err := os.Remove(*option.localSocket); err != nil && !os.IsNotExist(err) {
+		glog.Fatalf("Failed to remove %s, error: %s", *option.localSocket, err.Error())
+	}
+	montSocketListener, err := net.Listen("unix", *option.localSocket)
+	if err != nil {
+		glog.Fatalf("Failed to listen on %s: %v", *option.localSocket, err)
+	}
+	removeMountSocket := mountSocketCleanup(*option.localSocket)
+	defer removeMountSocket()
+	grace.OnInterrupt(removeMountSocket)
 
 	// detect mount folder mode
 	if *option.dirAutoCreate {
-		os.MkdirAll(dir, os.FileMode(0777)&^umask)
+		if err := os.MkdirAll(dir, os.FileMode(0777)&^umask); err != nil {
+			removeMountSocket()
+			glog.Fatalf("failed to create directory %s:%v", dir, err)
+		}
 	}
 	fileInfo, err := os.Stat(dir)
 
+	// collect uid, gid
 	uid, gid := uint32(0), uint32(0)
 	mountMode := os.ModeDir | 0777
 	if err == nil {
@@ -116,6 +94,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		return false
 	}
 
+	// detect uid, gid
 	if uid == 0 {
 		if u, err := user.Current(); err == nil {
 			if parsedId, pe := strconv.ParseUint(u.Uid, 10, 32); pe == nil {
@@ -136,99 +115,163 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	}
 
 	// Ensure target mount point availability
-	if isValid := checkMountPointAvailable(dir); !isValid {
-		glog.Fatalf("Expected mount to still be active, target mount point: %s, please check!", dir)
+	skipAutofs := option.hasAutofs != nil && *option.hasAutofs
+	if isValid := checkMountPointAvailable(dir, skipAutofs); !isValid {
+		removeMountSocket()
+		glog.Fatalf("Target mount point is not available: %s, please check!", dir)
 		return true
 	}
 
-	mountName := path.Base(dir)
+	serverFriendlyName := strings.ReplaceAll(*option.filer, ",", "+")
 
-	options := []fuse.MountOption{
-		fuse.VolumeName(mountName),
-		fuse.FSName(filer + ":" + filerMountRootPath),
-		fuse.Subtype("seaweedfs"),
-		// fuse.NoAppleDouble(), // include .DS_Store, otherwise can not delete non-empty folders
-		fuse.NoAppleXattr(),
-		fuse.ExclCreate(),
-		fuse.DaemonTimeout("3600"),
-		fuse.AllowSUID(),
-		fuse.DefaultPermissions(),
-		fuse.MaxReadahead(1024 * 128),
-		fuse.AsyncRead(),
-		fuse.WritebackCache(),
-		fuse.MaxBackground(128),
-		fuse.CongestionThreshold(128),
+	// When autofs/systemd-mount is used, FsName must be "fuse" so util-linux/mount can recognize
+	// it as a pseudo filesystem. Otherwise, preserve the descriptive name for mount/df output.
+	fsName := serverFriendlyName + ":" + filerMountRootPath
+	if *option.volumeName != "" {
+		fsName = *option.volumeName
+	}
+	if skipAutofs {
+		fsName = "fuse"
 	}
 
-	options = append(options, osSpecificMountOptions()...)
-	if *option.allowOthers {
-		options = append(options, fuse.AllowOther())
+	maxBackground := 128
+	if option.fuseMaxBackground != nil && *option.fuseMaxBackground > 0 {
+		maxBackground = *option.fuseMaxBackground
+	}
+	congestionThreshold := 0
+	if option.fuseCongestionThreshold != nil && *option.fuseCongestionThreshold > 0 {
+		congestionThreshold = *option.fuseCongestionThreshold
+	}
+
+	// mount fuse
+	fuseMountOptions := &fuse.MountOptions{
+		AllowOther:               *option.allowOthers,
+		MaxBackground:            maxBackground,
+		CongestionThreshold:      congestionThreshold,
+		MaxWrite:                 1024 * 1024 * 2,
+		MaxReadAhead:             1024 * 1024 * 2,
+		IgnoreSecurityLabels:     false,
+		RememberInodes:           false,
+		FsName:                   fsName,
+		Name:                     "seaweedfs",
+		SingleThreaded:           false,
+		DisableXAttrs:            *option.disableXAttr,
+		Debug:                    *option.debugFuse,
+		EnableLocks:              true,
+		ExplicitDataCacheControl: false,
+		DirectMount:              true,
+		DirectMountFlags:         0,
+		//SyncRead:                 false, // set to false to enable the FUSE_CAP_ASYNC_READ capability
+		EnableAcl: true,
+	}
+	if *option.defaultPermissions {
+		fuseMountOptions.Options = append(fuseMountOptions.Options, "default_permissions")
 	}
 	if *option.nonempty {
-		options = append(options, fuse.AllowNonEmptyMount())
+		fuseMountOptions.Options = append(fuseMountOptions.Options, "nonempty")
 	}
 	if *option.readOnly {
-		options = append(options, fuse.ReadOnly())
+		if runtime.GOOS == "darwin" {
+			fuseMountOptions.Options = append(fuseMountOptions.Options, "rdonly")
+		} else {
+			fuseMountOptions.Options = append(fuseMountOptions.Options, "ro")
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		// https://github-wiki-see.page/m/macfuse/macfuse/wiki/Mount-Options
+		ioSizeMB := 1
+		for ioSizeMB*2 <= *option.chunkSizeLimitMB && ioSizeMB*2 <= 32 {
+			ioSizeMB *= 2
+		}
+		fuseMountOptions.Options = append(fuseMountOptions.Options, "daemon_timeout=600")
+		if runtime.GOARCH == "amd64" {
+			fuseMountOptions.Options = append(fuseMountOptions.Options, "noapplexattr")
+		}
+		if option.novncache != nil && *option.novncache {
+			fuseMountOptions.Options = append(fuseMountOptions.Options, "novncache")
+		}
+		fuseMountOptions.Options = append(fuseMountOptions.Options, "slow_statfs")
+		fuseMountOptions.Options = append(fuseMountOptions.Options, "volname="+volumeName(*option.filer, filerMountRootPath, dir, *option.volumeName))
+		fuseMountOptions.Options = append(fuseMountOptions.Options, fmt.Sprintf("iosize=%d", ioSizeMB*1024*1024))
+	}
+	// Last, so an option given on the command line wins over the default
+	// this mount picked for it.
+	fuseMountOptions.Options = append(fuseMountOptions.Options, option.extraOptions...)
+
+	if option.writebackCache != nil {
+		fuseMountOptions.EnableWriteback = *option.writebackCache
+	}
+	if option.asyncDio != nil {
+		fuseMountOptions.EnableAsyncDio = *option.asyncDio
+	}
+	if option.cacheSymlink != nil && *option.cacheSymlink {
+		fuseMountOptions.EnableSymlinkCaching = true
 	}
 
-	// find mount point
-	mountRoot := filerMountRootPath
-	if mountRoot != "/" && strings.HasSuffix(mountRoot, "/") {
-		mountRoot = mountRoot[0 : len(mountRoot)-1]
-	}
+	mountRoot := resolveMountRoot(filerMountRootPath)
+	cacheDirForRead, cacheDirForWrite := resolveCacheDirs(option)
 
-	diskType := types.ToDiskType(*option.diskType)
-
-	seaweedFileSystem := filesys.NewSeaweedFileSystem(&filesys.Option{
-		MountDirectory:     dir,
-		FilerAddress:       filer,
-		FilerGrpcAddress:   filerGrpcAddress,
-		GrpcDialOption:     grpcDialOption,
-		FilerMountRootPath: mountRoot,
-		Collection:         *option.collection,
-		Replication:        *option.replication,
-		TtlSec:             int32(*option.ttlSec),
-		DiskType:           diskType,
-		ChunkSizeLimit:     int64(chunkSizeLimitMB) * 1024 * 1024,
-		ConcurrentWriters:  *option.concurrentWriters,
-		CacheDir:           *option.cacheDir,
-		CacheSizeMB:        *option.cacheSizeMB,
-		DataCenter:         *option.dataCenter,
-		MountUid:           uid,
-		MountGid:           gid,
-		MountMode:          mountMode,
-		MountCtime:         fileInfo.ModTime(),
-		MountMtime:         time.Now(),
-		Umask:              umask,
-		VolumeServerAccess: *mountOptions.volumeServerAccess,
-		Cipher:             cipher,
-		UidGidMapper:       uidGidMapper,
+	seaweedFileSystem := buildSeaweedFileSystem(option, fileSystemParams{
+		dir:              dir,
+		mountRoot:        mountRoot,
+		filerAddresses:   filerAddresses,
+		grpcDialOption:   grpcDialOption,
+		cipher:           cipher,
+		uidGidMapper:     uidGidMapper,
+		uid:              uid,
+		gid:              gid,
+		mountMode:        mountMode,
+		mountCtime:       fileInfo.ModTime(),
+		umask:            umask,
+		chunkSizeLimitMB: chunkSizeLimitMB,
+		cacheDirForRead:  cacheDirForRead,
+		cacheDirForWrite: cacheDirForWrite,
 	})
 
-	// mount
-	c, err := fuse.Mount(dir, options...)
+	if !createMountRoot(seaweedFileSystem, mountRoot, bucketRootPath, filerAddresses) {
+		return false
+	}
+
+	server, err := fuse.NewServer(seaweedFileSystem, dir, fuseMountOptions)
 	if err != nil {
-		glog.V(0).Infof("mount: %v", err)
-		return true
+		// A failed mount is an environment problem (no /dev/fuse, fusermount not
+		// setuid, stale mount point); the goroutine dump Fatalf adds buries it.
+		removeMountSocket()
+		glog.Exitf("Mount fail: %v", err)
 	}
-	defer fuse.Unmount(dir)
-
 	grace.OnInterrupt(func() {
-		fuse.Unmount(dir)
-		c.Close()
+		if err := unmount.Unmount(dir); err != nil {
+			glog.Errorf("failed to unmount %s: %v", dir, err)
+		}
 	})
 
-	glog.V(0).Infof("mounted %s%s to %s", filer, mountRoot, dir)
-	server := fs.New(c, nil)
-	seaweedFileSystem.Server = server
-	err = server.Serve(seaweedFileSystem)
-
-	// check if the mount process has an error to report
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		glog.V(0).Infof("mount process: %v", err)
-		return true
+	if mountOptions.fuseCommandPid != 0 {
+		// send a signal to the parent process to notify that the mount is ready
+		err = syscall.Kill(mountOptions.fuseCommandPid, syscall.SIGTERM)
+		if err != nil {
+			fmt.Printf("failed to notify parent process: %v\n", err)
+			return false
+		}
 	}
+
+	serveMountGrpc(seaweedFileSystem, montSocketListener)
+
+	err = seaweedFileSystem.StartBackgroundTasks()
+	if err != nil {
+		fmt.Printf("failed to start background tasks: %v\n", err)
+		return false
+	}
+
+	glog.V(0).Infof("mounted %s%s to %v", *option.filer, mountRoot, dir)
+	glog.V(0).Infof("This is SeaweedFS version %s %s %s", version.Version(), runtime.GOOS, runtime.GOARCH)
+
+	server.Serve()
+
+	// Wait for any pending background flushes (writebackCache async mode)
+	// before clearing caches, to prevent data loss during clean unmount.
+	seaweedFileSystem.WaitForAsyncFlush()
+
+	seaweedFileSystem.ClearCacheDir()
 
 	return true
 }

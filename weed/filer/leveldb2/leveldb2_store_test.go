@@ -2,18 +2,18 @@ package leveldb
 
 import (
 	"context"
-	"io/ioutil"
-	"os"
+	"math"
+	"strings"
 	"testing"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func TestCreateAndFind(t *testing.T) {
-	testFiler := filer.NewFiler(nil, nil, "", 0, "", "", "", nil)
-	dir, _ := ioutil.TempDir("", "seaweedfs_filer_test")
-	defer os.RemoveAll(dir)
+	testFiler := filer.NewFiler(pb.ServerDiscovery{}, nil, "", "", "", "", "", 255, nil)
+	dir := t.TempDir()
 	store := &LevelDB2Store{}
 	store.initialize(dir, 2)
 	testFiler.SetStore(store)
@@ -31,7 +31,7 @@ func TestCreateAndFind(t *testing.T) {
 		},
 	}
 
-	if err := testFiler.CreateEntry(ctx, entry1, false, false, nil); err != nil {
+	if err := testFiler.CreateEntry(ctx, entry1, nil, false, false, nil, false, testFiler.MaxFilenameLength); err != nil {
 		t.Errorf("create entry %v: %v", entry1.FullPath, err)
 		return
 	}
@@ -49,14 +49,14 @@ func TestCreateAndFind(t *testing.T) {
 	}
 
 	// checking one upper directory
-	entries, _, _ := testFiler.ListDirectoryEntries(ctx, util.FullPath("/home/chris/this/is/one"), "", false, 100, "", "")
+	entries, _, _ := testFiler.ListDirectoryEntries(ctx, util.FullPath("/home/chris/this/is/one"), "", false, 100, "", "", "")
 	if len(entries) != 1 {
 		t.Errorf("list entries count: %v", len(entries))
 		return
 	}
 
 	// checking one upper directory
-	entries, _, _ = testFiler.ListDirectoryEntries(ctx, util.FullPath("/"), "", false, 100, "", "")
+	entries, _, _ = testFiler.ListDirectoryEntries(ctx, util.FullPath("/"), "", false, 100, "", "", "")
 	if len(entries) != 1 {
 		t.Errorf("list entries count: %v", len(entries))
 		return
@@ -64,10 +64,121 @@ func TestCreateAndFind(t *testing.T) {
 
 }
 
+type fakeConfiguration map[string]interface{}
+
+func (c fakeConfiguration) GetString(key string) string {
+	value, _ := c[key].(string)
+	return value
+}
+
+func (c fakeConfiguration) GetBool(key string) bool {
+	value, _ := c[key].(bool)
+	return value
+}
+
+func (c fakeConfiguration) GetInt(key string) int {
+	value, _ := c[key].(int)
+	return value
+}
+
+func (c fakeConfiguration) GetStringSlice(key string) []string {
+	value, _ := c[key].([]string)
+	return value
+}
+
+func (c fakeConfiguration) SetDefault(key string, value interface{}) {
+	if _, found := c[key]; !found {
+		c[key] = value
+	}
+}
+
+func TestInitializeOptions(t *testing.T) {
+	store := &LevelDB2Store{}
+	if err := store.Initialize(fakeConfiguration{
+		"leveldb2.dir":                      t.TempDir(),
+		"leveldb2.block_cache_size_mb":      64,
+		"leveldb2.write_buffer_size_mb":     32,
+		"leveldb2.block_size_kb":            16,
+		"leveldb2.compaction_table_size_mb": 8,
+	}, "leveldb2."); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	defer store.Shutdown()
+
+	opts := store.buildOptions()
+	if opts.BlockCacheCapacity != 64*1024*1024 {
+		t.Errorf("block cache %d, want 64MiB", opts.BlockCacheCapacity)
+	}
+	if opts.WriteBuffer != 32*1024*1024 {
+		t.Errorf("write buffer %d, want 32MiB", opts.WriteBuffer)
+	}
+	if opts.BlockSize != 16*1024 {
+		t.Errorf("block size %d, want 16KiB", opts.BlockSize)
+	}
+	if opts.CompactionTableSize != 8*1024*1024 {
+		t.Errorf("compaction table size %d, want 8MiB", opts.CompactionTableSize)
+	}
+}
+
+func TestInitializeDefaultOptions(t *testing.T) {
+	store := &LevelDB2Store{}
+	if err := store.Initialize(fakeConfiguration{
+		"leveldb2.dir":                  t.TempDir(),
+		"leveldb2.block_cache_size_mb":  -1,
+		"leveldb2.write_buffer_size_mb": 0,
+	}, "leveldb2."); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	defer store.Shutdown()
+
+	opts := store.buildOptions()
+	if opts.BlockCacheCapacity != 32*1024*1024 {
+		t.Errorf("block cache %d, want the 32MiB default", opts.BlockCacheCapacity)
+	}
+	if opts.WriteBuffer != 16*1024*1024 {
+		t.Errorf("write buffer %d, want the 16MiB default", opts.WriteBuffer)
+	}
+}
+
+func TestInitializeRejectsOversizedOption(t *testing.T) {
+	store := &LevelDB2Store{}
+	err := store.Initialize(fakeConfiguration{
+		"leveldb2.dir":                  t.TempDir(),
+		"leveldb2.write_buffer_size_mb": math.MaxInt/(1<<20) + 1,
+	}, "leveldb2.")
+	if err == nil || !strings.Contains(err.Error(), "write_buffer_size_mb") {
+		t.Fatalf("expected overflow rejection, got %v", err)
+	}
+}
+
+func TestListDirectoryPrefixedEntries_StartBelowPrefix(t *testing.T) {
+	store := &LevelDB2Store{}
+	store.initialize(t.TempDir(), 2)
+	defer store.Shutdown()
+
+	ctx := context.Background()
+	for _, name := range []string{"item-a", "item-a.versions", "item-b.versions"} {
+		if err := store.InsertEntry(ctx, &filer.Entry{FullPath: util.FullPath("/d/" + name)}); err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+	}
+
+	var names []string
+	_, err := store.ListDirectoryPrefixedEntries(ctx, util.FullPath("/d"), "item", true, 100, "item-b", func(entry *filer.Entry) (bool, error) {
+		names = append(names, entry.Name())
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(names) != 1 || names[0] != "item-b.versions" {
+		t.Fatalf("want [item-b.versions], got %v", names)
+	}
+}
+
 func TestEmptyRoot(t *testing.T) {
-	testFiler := filer.NewFiler(nil, nil, "", 0, "", "", "", nil)
-	dir, _ := ioutil.TempDir("", "seaweedfs_filer_test2")
-	defer os.RemoveAll(dir)
+	testFiler := filer.NewFiler(pb.ServerDiscovery{}, nil, "", "", "", "", "", 255, nil)
+	dir := t.TempDir()
 	store := &LevelDB2Store{}
 	store.initialize(dir, 2)
 	testFiler.SetStore(store)
@@ -75,7 +186,7 @@ func TestEmptyRoot(t *testing.T) {
 	ctx := context.Background()
 
 	// checking one upper directory
-	entries, _, err := testFiler.ListDirectoryEntries(ctx, util.FullPath("/"), "", false, 100, "", "")
+	entries, _, err := testFiler.ListDirectoryEntries(ctx, util.FullPath("/"), "", false, 100, "", "", "")
 	if err != nil {
 		t.Errorf("list entries: %v", err)
 		return
@@ -85,4 +196,31 @@ func TestEmptyRoot(t *testing.T) {
 		return
 	}
 
+}
+
+func TestUnavailableDatabaseFailsListAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	store := &LevelDB2Store{}
+	if err := store.initialize(dir, 2); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.InsertEntry(ctx, &filer.Entry{FullPath: "/dir/file"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, db := range store.dbs {
+		db.Close()
+	}
+
+	listed := 0
+	_, err := store.ListDirectoryEntries(ctx, "/dir", "", true, 10, func(*filer.Entry) (bool, error) {
+		listed++
+		return true, nil
+	})
+	if err == nil || listed != 0 {
+		t.Fatalf("list on a closed database: %d entries, err %v", listed, err)
+	}
+	if err := store.DeleteFolderChildren(ctx, "/dir"); err == nil {
+		t.Fatal("delete children on a closed database succeeded")
+	}
 }

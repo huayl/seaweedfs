@@ -1,105 +1,49 @@
 package iamapi
 
 import (
-	"bytes"
-	"encoding/xml"
-	"fmt"
-	"strconv"
-
 	"net/http"
-	"net/url"
-	"time"
-
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
 
 	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 )
 
-type mimeType string
-
-const (
-	mimeNone mimeType = ""
-	mimeXML  mimeType = "application/xml"
-)
-
-func setCommonHeaders(w http.ResponseWriter) {
-	w.Header().Set("x-amz-request-id", fmt.Sprintf("%d", time.Now().UnixNano()))
-	w.Header().Set("Accept-Ranges", "bytes")
-}
-
-// Encodes the response headers into XML format.
-func encodeResponse(response interface{}) []byte {
-	var bytesBuffer bytes.Buffer
-	bytesBuffer.WriteString(xml.Header)
-	e := xml.NewEncoder(&bytesBuffer)
-	e.Encode(response)
-	return bytesBuffer.Bytes()
-}
-
-// If none of the http routes match respond with MethodNotAllowed
-func notFoundHandler(w http.ResponseWriter, r *http.Request) {
-	glog.V(0).Infof("unsupported %s %s", r.Method, r.RequestURI)
-	writeErrorResponse(w, s3err.ErrMethodNotAllowed, r.URL)
-}
-
-func writeErrorResponse(w http.ResponseWriter, errorCode s3err.ErrorCode, reqURL *url.URL) {
-	apiError := s3err.GetAPIError(errorCode)
-	errorResponse := getRESTErrorResponse(apiError, reqURL.Path)
-	encodedErrorResponse := encodeResponse(errorResponse)
-	writeResponse(w, apiError.HTTPStatusCode, encodedErrorResponse, mimeXML)
-}
-
-func writeIamErrorResponse(w http.ResponseWriter, err error, object string, value string, msg error) {
-	errCode := err.Error()
+func newErrorResponse(errCode string, errMsg string, requestID string) ErrorResponse {
 	errorResp := ErrorResponse{}
 	errorResp.Error.Type = "Sender"
 	errorResp.Error.Code = &errCode
-	if msg != nil {
-		errMsg := msg.Error()
-		errorResp.Error.Message = &errMsg
+	errorResp.Error.Message = &errMsg
+	errorResp.SetRequestId(requestID)
+	return errorResp
+}
+
+func writeIamErrorResponse(w http.ResponseWriter, r *http.Request, reqID string, iamError *IamError) {
+	if iamError == nil {
+		glog.Errorf("writeIamErrorResponse called with nil error")
+		internalResp := newErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalResp)
+		return
 	}
-	glog.Errorf("Response %+v", err)
+
+	errCode := iamError.Code
+	errMsg := iamError.Error.Error()
+	glog.Errorf("Response %+v", errMsg)
+
+	errorResp := newErrorResponse(errCode, errMsg, reqID)
+	internalErrorResponse := newErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+	internalErrorResponse.Error.Type = "Receiver"
+
 	switch errCode {
 	case iam.ErrCodeNoSuchEntityException:
-		msg := fmt.Sprintf("The %s with name %s cannot be found.", object, value)
-		errorResp.Error.Message = &msg
-		writeResponse(w, http.StatusNotFound, encodeResponse(errorResp), mimeXML)
+		s3err.WriteXMLResponse(w, r, http.StatusNotFound, errorResp)
+	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException:
+		s3err.WriteXMLResponse(w, r, http.StatusBadRequest, errorResp)
+	case iam.ErrCodeDeleteConflictException, iam.ErrCodeEntityAlreadyExistsException:
+		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
 	case iam.ErrCodeServiceFailureException:
-		writeResponse(w, http.StatusInternalServerError, encodeResponse(errorResp), mimeXML)
+		// We do not want to expose internal server error to the client
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	default:
-		writeResponse(w, http.StatusInternalServerError, encodeResponse(errorResp), mimeXML)
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	}
-}
-
-func getRESTErrorResponse(err s3err.APIError, resource string) s3err.RESTErrorResponse {
-	return s3err.RESTErrorResponse{
-		Code:      err.Code,
-		Message:   err.Description,
-		Resource:  resource,
-		RequestID: fmt.Sprintf("%d", time.Now().UnixNano()),
-	}
-}
-
-func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
-	setCommonHeaders(w)
-	if response != nil {
-		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
-	}
-	if mType != mimeNone {
-		w.Header().Set("Content-Type", string(mType))
-	}
-	w.WriteHeader(statusCode)
-	if response != nil {
-		glog.V(4).Infof("status %d %s: %s", statusCode, mType, string(response))
-		_, err := w.Write(response)
-		if err != nil {
-			glog.V(0).Infof("write err: %v", err)
-		}
-		w.(http.Flusher).Flush()
-	}
-}
-
-func writeSuccessResponseXML(w http.ResponseWriter, response []byte) {
-	writeResponse(w, http.StatusOK, response, mimeXML)
 }

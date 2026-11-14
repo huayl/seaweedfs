@@ -1,3 +1,5 @@
+//go:build elastic
+
 package elastic
 
 import (
@@ -6,12 +8,12 @@ import (
 	"math"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
 	jsoniter "github.com/json-iterator/go"
 	elastic "github.com/olivere/elastic/v7"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -32,6 +34,7 @@ var (
 
 type ESEntry struct {
 	ParentId string `json:"ParentId"`
+	Id       string `json:"Id,omitempty"`
 	Entry    *filer.Entry
 }
 
@@ -41,15 +44,31 @@ type ESKVEntry struct {
 
 func init() {
 	filer.Stores = append(filer.Stores, &ElasticStore{})
+	filer.Stores = append(filer.Stores, &Elastic8Store{})
 }
 
 type ElasticStore struct {
 	client      *elastic.Client
 	maxPageSize int
+	es8         bool
 }
 
 func (store *ElasticStore) GetName() string {
 	return "elastic7"
+}
+
+// Elastic8Store sorts listings on an indexed Id field since Elasticsearch 8 disallows _id fielddata.
+type Elastic8Store struct {
+	ElasticStore
+}
+
+func (store *Elastic8Store) GetName() string {
+	return "elastic8"
+}
+
+func (store *Elastic8Store) Initialize(configuration weed_util.Configuration, prefix string) (err error) {
+	store.es8 = true
+	return store.ElasticStore.Initialize(configuration, prefix)
 }
 
 func (store *ElasticStore) Initialize(configuration weed_util.Configuration, prefix string) (err error) {
@@ -75,12 +94,12 @@ func (store *ElasticStore) initialize(options []elastic.ClientOptionFunc) (err e
 	ctx := context.Background()
 	store.client, err = elastic.NewClient(options...)
 	if err != nil {
-		return fmt.Errorf("init elastic %v.", err)
+		return fmt.Errorf("init elastic %w", err)
 	}
 	if ok, err := store.client.IndexExists(indexKV).Do(ctx); err == nil && !ok {
 		_, err = store.client.CreateIndex(indexKV).Body(kvMappings).Do(ctx)
 		if err != nil {
-			return fmt.Errorf("create index(%s) %v.", indexKV, err)
+			return fmt.Errorf("create index(%s) %v", indexKV, err)
 		}
 	}
 	return nil
@@ -108,10 +127,13 @@ func (store *ElasticStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 		ParentId: weed_util.Md5String([]byte(dir)),
 		Entry:    entry,
 	}
+	if store.es8 {
+		esEntry.Id = id
+	}
 	value, err := jsoniter.Marshal(esEntry)
 	if err != nil {
-		glog.Errorf("insert entry(%s) %v.", string(entry.FullPath), err)
-		return fmt.Errorf("insert entry %v.", err)
+		glog.ErrorfCtx(ctx, "insert entry(%s) %v.", string(entry.FullPath), err)
+		return fmt.Errorf("insert entry marshal %w", err)
 	}
 	_, err = store.client.Index().
 		Index(index).
@@ -120,8 +142,8 @@ func (store *ElasticStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 		BodyJson(string(value)).
 		Do(ctx)
 	if err != nil {
-		glog.Errorf("insert entry(%s) %v.", string(entry.FullPath), err)
-		return fmt.Errorf("insert entry %v.", err)
+		glog.ErrorfCtx(ctx, "insert entry(%s) %v.", string(entry.FullPath), err)
+		return fmt.Errorf("insert entry %w", err)
 	}
 	return nil
 }
@@ -149,15 +171,23 @@ func (store *ElasticStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 		err := jsoniter.Unmarshal(searchResult.Source, esEntry)
 		return esEntry.Entry, err
 	}
-	glog.Errorf("find entry(%s),%v.", string(fullpath), err)
+	glog.ErrorfCtx(ctx, "find entry(%s),%v.", string(fullpath), err)
 	return nil, filer_pb.ErrNotFound
 }
 
 func (store *ElasticStore) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	index := getIndex(fullpath, false)
 	id := weed_util.Md5String([]byte(fullpath))
-	if strings.Count(string(fullpath), "/") == 1 {
-		return store.deleteIndex(ctx, index)
+	strFullpath := string(fullpath)
+
+	// A top-level subdirectory refers to an Elasticsearch index.
+	// If we delete an entry at the top level, we should attempt to delete the corresponding Elasticsearch index.
+	if strings.Count(strFullpath, "/") == 1 {
+		entry, err2 := store.FindEntry(ctx, fullpath)
+		if err2 == nil && entry.IsDirectory() {
+			bucketIndex := indexPrefix + strFullpath[1:]
+			store.deleteIndex(ctx, bucketIndex)
+		}
 	}
 	return store.deleteEntry(ctx, index, id)
 }
@@ -167,7 +197,7 @@ func (store *ElasticStore) deleteIndex(ctx context.Context, index string) (err e
 	if elastic.IsNotFound(err) || (err == nil && deleteResult.Acknowledged) {
 		return nil
 	}
-	glog.Errorf("delete index(%s) %v.", index, err)
+	glog.ErrorfCtx(ctx, "delete index(%s) %v.", index, err)
 	return err
 }
 
@@ -182,17 +212,17 @@ func (store *ElasticStore) deleteEntry(ctx context.Context, index, id string) (e
 			return nil
 		}
 	}
-	glog.Errorf("delete entry(index:%s,_id:%s) %v.", index, id, err)
-	return fmt.Errorf("delete entry %v.", err)
+	glog.ErrorfCtx(ctx, "delete entry(index:%s,_id:%s) %v.", index, id, err)
+	return fmt.Errorf("delete entry %w", err)
 }
 
 func (store *ElasticStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
-	_, err = store.ListDirectoryEntries(ctx, fullpath, "", false, math.MaxInt32, func(entry *filer.Entry) bool {
+	_, err = store.ListDirectoryEntries(ctx, fullpath, "", false, math.MaxInt32, func(entry *filer.Entry) (bool, error) {
 		if err := store.DeleteEntry(ctx, entry.FullPath); err != nil {
-			glog.Errorf("elastic delete %s: %v.", entry.FullPath, err)
-			return false
+			glog.ErrorfCtx(ctx, "elastic delete %s: %v.", entry.FullPath, err)
+			return false, err
 		}
-		return true
+		return true, nil
 	})
 	return
 }
@@ -209,15 +239,17 @@ func (store *ElasticStore) listDirectoryEntries(
 	parentId := weed_util.Md5String([]byte(fullpath))
 	if _, err = store.client.Refresh(index).Do(ctx); err != nil {
 		if elastic.IsNotFound(err) {
-			store.client.CreateIndex(index).Do(ctx)
-			return
+			if _, err := store.client.CreateIndex(index).Do(ctx); err != nil {
+				return lastFileName, fmt.Errorf("create index(%s) %v", index, err)
+			}
+			return lastFileName, nil
 		}
 	}
 	for {
 		result := &elastic.SearchResult{}
 		if (startFileName == "" && first) || inclusive {
 			if result, err = store.search(ctx, index, parentId); err != nil {
-				glog.Errorf("search (%s,%s,%t,%d) %v.", string(fullpath), startFileName, inclusive, limit, err)
+				glog.ErrorfCtx(ctx, "search (%s,%s,%t,%d) %v.", string(fullpath), startFileName, inclusive, limit, err)
 				return
 			}
 		} else {
@@ -227,7 +259,7 @@ func (store *ElasticStore) listDirectoryEntries(
 			}
 			after := weed_util.Md5String([]byte(fullPath))
 			if result, err = store.searchAfter(ctx, index, parentId, after); err != nil {
-				glog.Errorf("searchAfter (%s,%s,%t,%d) %v.", string(fullpath), startFileName, inclusive, limit, err)
+				glog.ErrorfCtx(ctx, "searchAfter (%s,%s,%t,%d) %v.", string(fullpath), startFileName, inclusive, limit, err)
 				return
 			}
 		}
@@ -247,9 +279,17 @@ func (store *ElasticStore) listDirectoryEntries(
 				if fileName == startFileName && !inclusive {
 					continue
 				}
-				if !eachEntryFunc(esEntry.Entry) {
-					break
+
+				resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(esEntry.Entry)
+				if resEachEntryFuncErr != nil {
+					glog.ErrorfCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", fileName, resEachEntryFuncErr)
+					return lastFileName, fmt.Errorf("failed to process eachEntryFunc for entry %q: %w", fileName, resEachEntryFuncErr)
 				}
+
+				if !resEachEntryFunc {
+					return lastFileName, nil
+				}
+
 				lastFileName = fileName
 			}
 		}
@@ -258,6 +298,15 @@ func (store *ElasticStore) listDirectoryEntries(
 		}
 	}
 	return
+}
+
+func (store *ElasticStore) listSorter() elastic.Sorter {
+	field := "_id"
+	if store.es8 {
+		field = "Id.keyword"
+	}
+	// unmapped_type tolerates indexes with no documents yet
+	return elastic.NewFieldSort(field).Desc().UnmappedType("keyword")
 }
 
 func (store *ElasticStore) search(ctx context.Context, index, parentId string) (result *elastic.SearchResult, err error) {
@@ -271,7 +320,7 @@ func (store *ElasticStore) search(ctx context.Context, index, parentId string) (
 		Index(index).
 		Query(elastic.NewMatchQuery("ParentId", parentId)).
 		Size(store.maxPageSize).
-		Sort("_id", false).
+		SortBy(store.listSorter()).
 		Do(ctx)
 	return queryResult, err
 }
@@ -282,7 +331,7 @@ func (store *ElasticStore) searchAfter(ctx context.Context, index, parentId, aft
 		Query(elastic.NewMatchQuery("ParentId", parentId)).
 		SearchAfter(after).
 		Size(store.maxPageSize).
-		Sort("_id", false).
+		SortBy(store.listSorter()).
 		Do(ctx)
 	return queryResult, err
 

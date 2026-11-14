@@ -1,5 +1,7 @@
 package s3err
 
+import "github.com/seaweedfs/seaweedfs/weed/util/constants"
+
 /*
  * MinIO Go Library for Amazon S3 Compatible Cloud Storage
  * Copyright 2015-2017 MinIO, Inc.
@@ -21,7 +23,7 @@ package s3err
 // http://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
 var s3ErrorResponseMap = map[string]string{
 	"AccessDenied":                      "Access Denied.",
-	"BadDigest":                         "The Content-Md5 you specified did not match what we received.",
+	"BadDigest":                         constants.ErrMsgBadDigest,
 	"EntityTooSmall":                    "Your proposed upload is smaller than the minimum allowed object size.",
 	"EntityTooLarge":                    "Your proposed upload exceeds the maximum allowed object size.",
 	"IncompleteBody":                    "You did not provide the number of bytes specified by the Content-Length HTTP header.",
@@ -58,4 +60,5 @@ var s3ErrorResponseMap = map[string]string{
 	"InvalidDuration":                   "Duration provided in the request is invalid.",
 	"XAmzContentSHA256Mismatch":         "The provided 'x-amz-content-sha256' header does not match what was computed.",
 	// Add new API errors here.
+	"NoSuchCORSConfiguration": "The CORS configuration does not exist",
 }

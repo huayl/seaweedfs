@@ -2,39 +2,55 @@ package command
 
 import (
 	"fmt"
-	flag "github.com/chrislusf/seaweedfs/weed/util/fla9"
 	"os"
 	"strings"
+
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
 )
 
 var Commands = []*Command{
-	cmdBenchmark,
+	cmdAdmin,
+	cmdAutocomplete,
+	cmdUnautocomplete,
 	cmdBackup,
+	cmdBenchmark,
 	cmdCompact,
-	cmdCopy,
 	cmdDownload,
 	cmdExport,
 	cmdFiler,
 	cmdFilerBackup,
 	cmdFilerCat,
+	cmdFilerCopy,
 	cmdFilerMetaBackup,
+	cmdFilerMetaScan,
 	cmdFilerMetaTail,
+	cmdFilerRemoteGateway,
+	cmdFilerRemoteSynchronize,
 	cmdFilerReplicate,
 	cmdFilerSynchronize,
+	cmdFilerSyncVerify,
 	cmdFix,
-	cmdGateway,
-	cmdMaster,
-	cmdMount,
-	cmdS3,
+	cmdFuse,
 	cmdIam,
-	cmdMsgBroker,
+	cmdImage,
+	cmdMaster,
+	cmdMasterFollower,
+	cmdMini,
+	cmdMount,
+	cmdMqAgent,
+	cmdMqBroker,
+	cmdMqKafkaGateway,
+	cmdS3,
 	cmdScaffold,
 	cmdServer,
 	cmdShell,
+	cmdUpdate,
 	cmdUpload,
 	cmdVersion,
 	cmdVolume,
 	cmdWebDav,
+	cmdSftp,
+	cmdWorker,
 }
 
 type Command struct {
@@ -81,4 +97,18 @@ func (c *Command) Usage() {
 // it is a documentation pseudo-command such as importpath.
 func (c *Command) Runnable() bool {
 	return c.Run != nil
+}
+
+// Recorded, not os.Exit'ed, so the failure still travels through main's
+// shutdown path. The highest requested status wins.
+var commandExitStatus int
+
+func SetCommandExitStatus(n int) {
+	if n > commandExitStatus {
+		commandExitStatus = n
+	}
+}
+
+func CommandExitStatus() int {
+	return commandExitStatus
 }

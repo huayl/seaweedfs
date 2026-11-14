@@ -2,15 +2,16 @@ package B2Sink
 
 import (
 	"context"
-	"github.com/chrislusf/seaweedfs/weed/replication/repl_util"
+	"fmt"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/replication/sink"
-	"github.com/chrislusf/seaweedfs/weed/replication/source"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/kurin/blazer/b2"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type B2Sink struct {
@@ -31,6 +32,10 @@ func (g *B2Sink) GetName() string {
 
 func (g *B2Sink) GetSinkToDirectory() string {
 	return g.dir
+}
+
+func (g *B2Sink) GetDestinationIdentity() string {
+	return g.bucket + "\x00" + g.dir
 }
 
 func (g *B2Sink) IsIncremental() bool {
@@ -79,7 +84,14 @@ func (g *B2Sink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bool, 
 
 	targetObject := bucket.Object(key)
 
-	return targetObject.Delete(context.Background())
+	err = targetObject.Delete(context.Background())
+	if err != nil {
+		// b2_download_file_by_name: 404: File with such name does not exist.
+		if strings.Contains(err.Error(), ": 404:") {
+			return nil
+		}
+	}
+	return err
 
 }
 
@@ -92,7 +104,10 @@ func (g *B2Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int
 	}
 
 	totalSize := filer.FileSize(entry)
-	chunkViews := filer.ViewFromChunks(g.filerSource.LookupFileId, entry.Chunks, 0, int64(totalSize))
+	chunkViews, err := filer.ViewFromChunks(context.Background(), g.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
+	if err != nil {
+		return fmt.Errorf("resolve chunks of %s: %w", key, err)
+	}
 
 	bucket, err := g.client.Bucket(context.Background(), g.bucket)
 	if err != nil {
@@ -101,15 +116,22 @@ func (g *B2Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int
 
 	targetObject := bucket.Object(key)
 	writer := targetObject.NewWriter(context.Background())
+	defer writer.Close()
 
 	writeFunc := func(data []byte) error {
 		_, writeErr := writer.Write(data)
 		return writeErr
 	}
 
-	defer writer.Close()
+	if len(entry.Content) > 0 {
+		content, err := repl_util.MaybeDecryptContent(entry.Content, entry)
+		if err != nil {
+			return fmt.Errorf("decrypt inline SSE content: %w", err)
+		}
+		return writeFunc(content)
+	}
 
-	if err := repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc); err != nil {
+	if err := repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc, entry); err != nil {
 		return err
 	}
 
@@ -118,11 +140,8 @@ func (g *B2Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int
 }
 
 func (g *B2Sink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
-
 	key = cleanKey(key)
-
-	// TODO improve efficiency
-	return false, nil
+	return true, g.CreateEntry(key, newEntry, signatures)
 }
 
 func cleanKey(key string) string {

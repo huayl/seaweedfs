@@ -1,14 +1,16 @@
+//go:build elastic
+
 package elastic
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
 	jsoniter "github.com/json-iterator/go"
 	elastic "github.com/olivere/elastic/v7"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 func (store *ElasticStore) KvDelete(ctx context.Context, key []byte) (err error) {
@@ -22,8 +24,8 @@ func (store *ElasticStore) KvDelete(ctx context.Context, key []byte) (err error)
 			return nil
 		}
 	}
-	glog.Errorf("delete key(id:%s) %v.", string(key), err)
-	return fmt.Errorf("delete key %v.", err)
+	glog.ErrorfCtx(ctx, "delete key(id:%s) %v.", string(key), err)
+	return fmt.Errorf("delete key %w", err)
 }
 
 func (store *ElasticStore) KvGet(ctx context.Context, key []byte) (value []byte, err error) {
@@ -35,13 +37,16 @@ func (store *ElasticStore) KvGet(ctx context.Context, key []byte) (value []byte,
 	if elastic.IsNotFound(err) {
 		return value, filer.ErrKvNotFound
 	}
+	if err != nil {
+		glog.ErrorfCtx(ctx, "find key(%s),%v.", string(key), err)
+		return value, err
+	}
 	if searchResult != nil && searchResult.Found {
 		esEntry := &ESKVEntry{}
 		if err := jsoniter.Unmarshal(searchResult.Source, esEntry); err == nil {
 			return esEntry.Value, nil
 		}
 	}
-	glog.Errorf("find key(%s),%v.", string(key), err)
 	return value, filer.ErrKvNotFound
 }
 
@@ -49,8 +54,8 @@ func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) 
 	esEntry := &ESKVEntry{value}
 	val, err := jsoniter.Marshal(esEntry)
 	if err != nil {
-		glog.Errorf("insert key(%s) %v.", string(key), err)
-		return fmt.Errorf("insert key %v.", err)
+		glog.ErrorfCtx(ctx, "insert key(%s) %v.", string(key), err)
+		return fmt.Errorf("insert key %w", err)
 	}
 	_, err = store.client.Index().
 		Index(indexKV).
@@ -59,7 +64,7 @@ func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) 
 		BodyJson(string(val)).
 		Do(ctx)
 	if err != nil {
-		return fmt.Errorf("kv put: %v", err)
+		return fmt.Errorf("kv put: %w", err)
 	}
 	return nil
 }

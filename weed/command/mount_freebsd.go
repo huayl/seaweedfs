@@ -1,13 +1,5 @@
 package command
 
-import (
-	"github.com/seaweedfs/fuse"
-)
-
-func osSpecificMountOptions() []fuse.MountOption {
-	return []fuse.MountOption{}
-}
-
-func checkMountPointAvailable(dir string) bool {
+func checkMountPointAvailable(dir string, skipAutofs bool) bool {
 	return true
 }

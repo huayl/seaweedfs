@@ -2,17 +2,19 @@ package topology
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Collection struct {
 	Name                     string
 	volumeSizeLimit          uint64
 	replicationAsMin         bool
+	maxWritableVolumes       int
 	storageType2VolumeLayout *util.ConcurrentReadMap
 }
 
@@ -39,9 +41,36 @@ func (c *Collection) GetOrCreateVolumeLayout(rp *super_block.ReplicaPlacement, t
 		keyString += string(diskType)
 	}
 	vl := c.storageType2VolumeLayout.Get(keyString, func() interface{} {
-		return NewVolumeLayout(rp, ttl, diskType, c.volumeSizeLimit, c.replicationAsMin)
+		layout := NewVolumeLayout(rp, ttl, diskType, c.volumeSizeLimit, c.replicationAsMin)
+		layout.maxWritableVolumes = c.maxWritableVolumes
+		return layout
 	})
 	return vl.(*VolumeLayout)
+}
+
+func (c *Collection) GetVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) (*VolumeLayout, bool) {
+	keyString := rp.String()
+	if ttl != nil {
+		keyString += ttl.String()
+	}
+	if diskType != types.HardDriveType {
+		keyString += string(diskType)
+	}
+	vl, ok := c.storageType2VolumeLayout.Find(keyString)
+	if !ok {
+		return nil, false
+	}
+	return vl.(*VolumeLayout), true
+}
+
+func (c *Collection) GetAllVolumeLayouts() []*VolumeLayout {
+	var vls []*VolumeLayout
+	for _, vl := range c.storageType2VolumeLayout.Items() {
+		if vl != nil {
+			vls = append(vls, vl.(*VolumeLayout))
+		}
+	}
+	return vls
 }
 
 func (c *Collection) DeleteVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) {
@@ -52,7 +81,10 @@ func (c *Collection) DeleteVolumeLayout(rp *super_block.ReplicaPlacement, ttl *n
 	if diskType != types.HardDriveType {
 		keyString += string(diskType)
 	}
-	c.storageType2VolumeLayout.Delete(keyString)
+	// Unpublish first so a racing registration re-resolves into a fresh layout.
+	if vl, found := c.storageType2VolumeLayout.Delete(keyString); found {
+		vl.(*VolumeLayout).releaseLookupOwnership()
+	}
 }
 
 func (c *Collection) Lookup(vid needle.VolumeId) []*DataNode {

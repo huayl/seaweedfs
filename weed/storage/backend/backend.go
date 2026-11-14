@@ -1,15 +1,15 @@
 package backend
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"io"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type BackendStorageFile interface {
@@ -25,8 +25,9 @@ type BackendStorageFile interface {
 type BackendStorage interface {
 	ToProperties() map[string]string
 	NewStorageFile(key string, tierInfo *volume_server_pb.VolumeInfo) BackendStorageFile
-	CopyFile(f *os.File, attributes map[string]string, fn func(progressed int64, percentage float32) error) (key string, size int64, err error)
-	DownloadFile(fileName string, key string, fn func(progressed int64, percentage float32) error) (size int64, err error)
+	// concurrency > 0 caps concurrent network transfers; <= 0 uses the backend default.
+	CopyFile(f *os.File, fn func(progressed int64, percentage float32) error, concurrency int) (key string, size int64, err error)
+	DownloadFile(fileName string, key string, fn func(progressed int64, percentage float32) error, concurrency int) (size int64, err error)
 	DeleteFile(key string) (err error)
 }
 

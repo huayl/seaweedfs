@@ -3,6 +3,8 @@ package s3api
 import (
 	"testing"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 )
 
 func TestCopyObjectResponse(t *testing.T) {
@@ -14,7 +16,7 @@ func TestCopyObjectResponse(t *testing.T) {
 		LastModified: time.Now(),
 	}
 
-	println(string(encodeResponse(response)))
+	println(string(s3err.EncodeXMLResponse(response)))
 
 }
 
@@ -27,6 +29,6 @@ func TestCopyPartResponse(t *testing.T) {
 		LastModified: time.Now(),
 	}
 
-	println(string(encodeResponse(response)))
+	println(string(s3err.EncodeXMLResponse(response)))
 
 }

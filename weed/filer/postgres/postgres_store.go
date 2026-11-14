@@ -1,18 +1,21 @@
+// Package postgres provides PostgreSQL filer store implementation
+// Migrated from github.com/lib/pq to github.com/jackc/pgx for:
+// - Active development and support
+// - Better performance and PostgreSQL-specific features
+// - Improved error handling (no more panics)
+// - Built-in logging capabilities
+// - Superior SSL certificate support
 package postgres
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"time"
+	"strconv"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/filer/abstract_sql"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	_ "github.com/lib/pq"
-)
-
-const (
-	CONNECTION_URL_PATTERN = "host=%s port=%d sslmode=%s connect_timeout=30"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/abstract_sql"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -28,7 +31,17 @@ func (store *PostgresStore) GetName() string {
 }
 
 func (store *PostgresStore) Initialize(configuration util.Configuration, prefix string) (err error) {
+	// Fewer idle slots than concurrent operations means a fresh connection per
+	// operation, until the filer runs out of ephemeral ports. connection_max_open
+	// stays unset: a listing runs a second query from its own callback, so a
+	// bounded pool deadlocks once the concurrency reaches it.
+	configuration.SetDefault(prefix+"connection_max_idle", 50)
+	configuration.SetDefault(prefix+"connection_max_lifetime_seconds", 300)
+	// Default on so minimal configs are not exposed to duplicate-key tx
+	// poisoning on Postgres; an explicit false still disables it.
+	configuration.SetDefault(prefix+"enableUpsert", true)
 	return store.initialize(
+		configuration.GetString(prefix+"createTable"),
 		configuration.GetString(prefix+"upsertQuery"),
 		configuration.GetBool(prefix+"enableUpsert"),
 		configuration.GetString(prefix+"username"),
@@ -38,25 +51,59 @@ func (store *PostgresStore) Initialize(configuration util.Configuration, prefix 
 		configuration.GetString(prefix+"database"),
 		configuration.GetString(prefix+"schema"),
 		configuration.GetString(prefix+"sslmode"),
+		configuration.GetString(prefix+"sslcert"),
+		configuration.GetString(prefix+"sslkey"),
+		configuration.GetString(prefix+"sslrootcert"),
+		configuration.GetString(prefix+"sslcrl"),
+		configuration.GetBool(prefix+"pgbouncer_compatible"),
 		configuration.GetInt(prefix+"connection_max_idle"),
 		configuration.GetInt(prefix+"connection_max_open"),
 		configuration.GetInt(prefix+"connection_max_lifetime_seconds"),
 	)
 }
 
-func (store *PostgresStore) initialize(upsertQuery string, enableUpsert bool, user, password, hostname string, port int, database, schema, sslmode string, maxIdle, maxOpen, maxLifetimeSeconds int) (err error) {
+func (store *PostgresStore) initialize(createTable, upsertQuery string, enableUpsert bool, user, password, hostname string, port int, database, schema, sslmode, sslcert, sslkey, sslrootcert, sslcrl string, pgbouncerCompatible bool, maxIdle, maxOpen, maxLifetimeSeconds int) (err error) {
 
 	store.SupportBucketTable = false
+	createTable = ResolveCreateTableQuery(createTable)
 	if !enableUpsert {
 		upsertQuery = ""
+	} else if upsertQuery == "" {
+		upsertQuery = DefaultUpsertQuery
 	}
-	store.SqlGenerator = &SqlGenPostgres{
-		CreateTableSqlTemplate: "",
-		DropTableSqlTemplate:   `drop table "%s"`,
+	gen := &SqlGenPostgres{
+		CreateTableSqlTemplate: createTable,
+		DropTableSqlTemplate:   `drop table if exists "%s"`,
 		UpsertQueryTemplate:    upsertQuery,
 	}
+	store.SqlGenerator = gen
 
-	sqlUrl := fmt.Sprintf(CONNECTION_URL_PATTERN, hostname, port, sslmode)
+	// pgx-optimized connection string with better timeouts and connection handling
+	sqlUrl := "connect_timeout=30"
+
+	if hostname != "" {
+		sqlUrl += " host=" + hostname
+	}
+	if port != 0 {
+		sqlUrl += " port=" + strconv.Itoa(port)
+	}
+
+	// SSL configuration - pgx provides better SSL support than lib/pq
+	if sslmode != "" {
+		sqlUrl += " sslmode=" + sslmode
+	}
+	if sslcert != "" {
+		sqlUrl += " sslcert=" + sslcert
+	}
+	if sslkey != "" {
+		sqlUrl += " sslkey=" + sslkey
+	}
+	if sslrootcert != "" {
+		sqlUrl += " sslrootcert=" + sslrootcert
+	}
+	if sslcrl != "" {
+		sqlUrl += " sslcrl=" + sslcrl
+	}
 	if user != "" {
 		sqlUrl += " user=" + user
 	}
@@ -69,25 +116,27 @@ func (store *PostgresStore) initialize(upsertQuery string, enableUpsert bool, us
 		sqlUrl += " dbname=" + database
 		adaptedSqlUrl += " dbname=" + database
 	}
-	if schema != "" {
+	if schema != "" && !pgbouncerCompatible {
 		sqlUrl += " search_path=" + schema
 		adaptedSqlUrl += " search_path=" + schema
 	}
-	var dbErr error
-	store.DB, dbErr = sql.Open("postgres", sqlUrl)
-	if dbErr != nil {
-		store.DB.Close()
-		store.DB = nil
-		return fmt.Errorf("can not connect to %s error:%v", adaptedSqlUrl, err)
+	db, openErr := OpenPGXDB(sqlUrl, adaptedSqlUrl, pgbouncerCompatible, maxIdle, maxOpen, maxLifetimeSeconds)
+	if openErr != nil {
+		return openErr
+	}
+	if err = store.UseConnectionPools(db, func() (*sql.DB, error) {
+		return OpenPGXDB(sqlUrl, adaptedSqlUrl, pgbouncerCompatible, maxIdle, maxOpen, maxLifetimeSeconds)
+	}, maxIdle, maxOpen, maxLifetimeSeconds); err != nil {
+		return err
 	}
 
-	store.DB.SetMaxIdleConns(maxIdle)
-	store.DB.SetMaxOpenConns(maxOpen)
-	store.DB.SetConnMaxLifetime(time.Duration(maxLifetimeSeconds) * time.Second)
-
-	if err = store.DB.Ping(); err != nil {
-		return fmt.Errorf("connect to %s error:%v", sqlUrl, err)
+	if createTable != "" {
+		if _, err = store.DB.ExecContext(context.Background(), gen.GetSqlCreateTable(abstract_sql.DEFAULT_TABLE)); err != nil {
+			return fmt.Errorf("init table %s: %v", abstract_sql.DEFAULT_TABLE, err)
+		}
 	}
+
+	ConfigureListOrdering(store.DB, gen)
 
 	return nil
 }

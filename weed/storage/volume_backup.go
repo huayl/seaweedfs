@@ -2,18 +2,22 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
 	"google.golang.org/grpc"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func (v *Volume) GetVolumeSyncStatus() *volume_server_pb.VolumeSyncStatusResponse {
@@ -24,11 +28,13 @@ func (v *Volume) GetVolumeSyncStatus() *volume_server_pb.VolumeSyncStatusRespons
 	if datSize, _, err := v.DataBackend.GetStat(); err == nil {
 		syncStatus.TailOffset = uint64(datSize)
 	}
+	syncStatus.VolumeId = uint32(v.Id)
 	syncStatus.Collection = v.Collection
 	syncStatus.IdxFileSize = v.nm.IndexFileSize()
 	syncStatus.CompactRevision = uint32(v.SuperBlock.CompactionRevision)
 	syncStatus.Ttl = v.SuperBlock.Ttl.String()
 	syncStatus.Replication = v.SuperBlock.ReplicaPlacement.String()
+	syncStatus.Version = uint32(v.SuperBlock.Version)
 	return syncStatus
 }
 
@@ -62,21 +68,35 @@ update needle map when receiving new .dat bytes. But seems not necessary now.)
 
 */
 
-func (v *Volume) IncrementalBackup(volumeServer string, grpcDialOption grpc.DialOption) error {
+func (v *Volume) IncrementalBackup(volumeServer pb.ServerAddress, grpcDialOption grpc.DialOption) error {
+
+	if err := v.UnavailableError(); err != nil {
+		return err
+	}
 
 	startFromOffset, _, _ := v.FileStat()
-	appendAtNs, err := v.findLastAppendAtNs()
+	cursor, err := v.backupCursor()
 	if err != nil {
 		return err
 	}
 
 	writeOffset := int64(startFromOffset)
+	indexOffset := int64(cursor.entryCount) * NeedleMapEntrySize
+	// only the in-memory map can reload rows it just wrote to the index
+	// file; other maps fall back to regenerating the index from .dat
+	cnm, canReplayIndex := v.nm.(*NeedleMap)
+	receivedIndex := false
 
-	err = operation.WithVolumeServerClient(volumeServer, grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+	err = operation.WithVolumeServerClient(false, volumeServer, grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 
 		stream, err := client.VolumeIncrementalCopy(context.Background(), &volume_server_pb.VolumeIncrementalCopyRequest{
-			VolumeId: uint32(v.Id),
-			SinceNs:  appendAtNs,
+			VolumeId:         uint32(v.Id),
+			SinceNs:          cursor.appendAtNs,
+			EntryCount:       cursor.entryCount,
+			LastNeedleKey:    uint64(cursor.key),
+			LastNeedleCookie: cursor.cookie,
+			LastNeedleSize:   int32(cursor.size),
+			EntriesHash:      cursor.entriesHash,
 		})
 		if err != nil {
 			return err
@@ -92,6 +112,21 @@ func (v *Volume) IncrementalBackup(volumeServer string, grpcDialOption grpc.Dial
 				}
 			}
 
+			if err := v.UnavailableError(); err != nil {
+				return err
+			}
+			if len(resp.IdxContent) > 0 {
+				receivedIndex = true
+				if !canReplayIndex {
+					continue
+				}
+				n, writeErr := cnm.IndexFile().WriteAt(resp.IdxContent, indexOffset)
+				if writeErr != nil {
+					return writeErr
+				}
+				indexOffset += int64(n)
+				continue
+			}
 			n, writeErr := v.DataBackend.WriteAt(resp.FileContent, writeOffset)
 			if writeErr != nil {
 				return writeErr
@@ -104,7 +139,37 @@ func (v *Volume) IncrementalBackup(volumeServer string, grpcDialOption grpc.Dial
 	})
 
 	if err != nil {
+		// Roll the files back to the pre-copy boundary: leftover bytes could
+		// split a row or be mistaken for applied ones on the next run.
+		if receivedIndex && canReplayIndex {
+			_ = cnm.truncateIndex(int64(cursor.entryCount) * NeedleMapEntrySize)
+		}
+		if writeOffset > int64(startFromOffset) {
+			_ = v.DataBackend.Truncate(int64(startFromOffset))
+		}
 		return err
+	}
+
+	if receivedIndex && canReplayIndex {
+		baseOffset := int64(cursor.entryCount) * NeedleMapEntrySize
+		// a failed replay is rolled back to the pre-copy boundary and the
+		// map rebuilt from the truncated index, so nothing keyed by the
+		// half-replayed tail is left behind
+		rollback := func() {
+			_ = cnm.truncateIndex(baseOffset)
+			_ = v.DataBackend.Truncate(int64(startFromOffset))
+			cnm.reset()
+			_ = cnm.DoOffsetLoading(v, cnm.IndexFile(), 0)
+		}
+		if err := cnm.truncateIndex(indexOffset); err != nil {
+			rollback()
+			return err
+		}
+		if err := cnm.DoOffsetLoading(v, cnm.IndexFile(), uint64(cursor.entryCount)); err != nil {
+			rollback()
+			return err
+		}
+		return nil
 	}
 
 	// add to needle map
@@ -112,58 +177,209 @@ func (v *Volume) IncrementalBackup(volumeServer string, grpcDialOption grpc.Dial
 
 }
 
-func (v *Volume) findLastAppendAtNs() (uint64, error) {
-	offset, err := v.locateLastAppendEntry()
-	if err != nil {
-		return 0, err
-	}
-	if offset.IsZero() {
-		return 0, nil
-	}
-	return v.readAppendAtNs(offset)
+// backupCursor identifies the last record of the local copy: its index
+// position and the needle itself. A replica can verify the same record at the
+// same position and resume from there, which stays correct when a different
+// replica answers, because appendAtNs stamps differ across replicas.
+type backupCursor struct {
+	entryCount  uint64
+	key         NeedleId
+	size        Size
+	cookie      uint32
+	appendAtNs  uint64
+	entriesHash uint64
 }
 
-func (v *Volume) locateLastAppendEntry() (Offset, error) {
-	indexFile, e := os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644)
-	if e != nil {
-		return Offset{}, fmt.Errorf("cannot read %s: %v", v.FileName(".idx"), e)
+func (v *Volume) backupCursor() (backupCursor, error) {
+	key, offset, size, entryCount, err := v.locateLastAppendEntry()
+	if err != nil {
+		return backupCursor{entryCount: entryCount}, err
+	}
+	entriesHash, err := v.hashIndexEntries(entryCount)
+	if err != nil {
+		return backupCursor{}, err
+	}
+	if offset.IsZero() {
+		// an index-only tombstone has no needle to read; key and size carry it
+		return backupCursor{entryCount: entryCount, key: key, size: size, entriesHash: entriesHash}, nil
+	}
+	n, err := v.readNeedleAt(offset)
+	if err != nil {
+		return backupCursor{}, err
+	}
+	return backupCursor{
+		entryCount:  entryCount,
+		key:         key,
+		size:        size,
+		cookie:      uint32(n.Cookie),
+		appendAtNs:  n.AppendAtNs,
+		entriesHash: entriesHash,
+	}, nil
+}
+
+// hashIndexEntries folds the (key, size) of the first entryCount index entries
+// into one FNV-1a checksum. The offset field is skipped because the same
+// record sits at different offsets on different replicas.
+func (v *Volume) hashIndexEntries(entryCount uint64) (uint64, error) {
+	indexFile, err := os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("cannot read %s: %v", v.FileName(".idx"), err)
 	}
 	defer indexFile.Close()
 
-	fi, err := indexFile.Stat()
-	if err != nil {
-		return Offset{}, fmt.Errorf("file %s stat error: %v", indexFile.Name(), err)
+	h := fnv.New64a()
+	buf := make([]byte, 1<<20)
+	remaining := int64(entryCount) * NeedleMapEntrySize
+	for remaining > 0 {
+		want := int64(len(buf))
+		if remaining < want {
+			want = remaining
+		}
+		want -= want % int64(NeedleMapEntrySize)
+		read, err := io.ReadFull(indexFile, buf[:want])
+		if err != nil {
+			return 0, fmt.Errorf("file %s read error: %v", indexFile.Name(), err)
+		}
+		for i := 0; i+NeedleMapEntrySize <= read; i += NeedleMapEntrySize {
+			h.Write(buf[i : i+NeedleIdSize])
+			h.Write(buf[i+NeedleIdSize+OffsetSize : i+NeedleMapEntrySize])
+		}
+		remaining -= int64(read)
+	}
+	return h.Sum64(), nil
+}
+
+func (v *Volume) locateLastAppendEntry() (key NeedleId, offset Offset, size Size, entryCount uint64, err error) {
+	indexFile, e := os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644)
+	if e != nil {
+		err = fmt.Errorf("cannot read %s: %v", v.FileName(".idx"), e)
+		return
+	}
+	defer indexFile.Close()
+
+	fi, e := indexFile.Stat()
+	if e != nil {
+		err = fmt.Errorf("file %s stat error: %v", indexFile.Name(), e)
+		return
 	}
 	fileSize := fi.Size()
 	if fileSize%NeedleMapEntrySize != 0 {
-		return Offset{}, fmt.Errorf("unexpected file %s size: %d", indexFile.Name(), fileSize)
+		err = fmt.Errorf("unexpected file %s size: %d", indexFile.Name(), fileSize)
+		return
 	}
+	entryCount = uint64(fileSize / NeedleMapEntrySize)
 	if fileSize == 0 {
-		return Offset{}, nil
+		return
 	}
 
 	bytes := make([]byte, NeedleMapEntrySize)
 	n, e := indexFile.ReadAt(bytes, fileSize-NeedleMapEntrySize)
 	if n != NeedleMapEntrySize {
-		return Offset{}, fmt.Errorf("file %s read error: %v", indexFile.Name(), e)
+		err = fmt.Errorf("file %s read error: %v", indexFile.Name(), e)
+		return
 	}
-	_, offset, _ := idx.IdxFileEntry(bytes)
-
-	return offset, nil
+	key, offset, size = idx.IdxFileEntry(bytes)
+	return
 }
 
-func (v *Volume) readAppendAtNs(offset Offset) (uint64, error) {
-
+func (v *Volume) readNeedleAt(offset Offset) (*needle.Needle, error) {
 	n, _, bodyLength, err := needle.ReadNeedleHeader(v.DataBackend, v.SuperBlock.Version, offset.ToActualOffset())
 	if err != nil {
-		return 0, fmt.Errorf("ReadNeedleHeader %s [%d,%d): %v", v.DataBackend.Name(), offset.ToActualOffset(), offset.ToActualOffset()+NeedleHeaderSize, err)
+		return nil, fmt.Errorf("ReadNeedleHeader %s [%d,%d): %v", v.DataBackend.Name(), offset.ToActualOffset(), offset.ToActualOffset()+NeedleHeaderSize, err)
 	}
 	_, err = n.ReadNeedleBody(v.DataBackend, v.SuperBlock.Version, offset.ToActualOffset()+NeedleHeaderSize, bodyLength)
 	if err != nil {
-		return 0, fmt.Errorf("ReadNeedleBody offset %d, bodyLength %d: %v", offset.ToActualOffset(), bodyLength, err)
+		return nil, fmt.Errorf("ReadNeedleBody offset %d, bodyLength %d: %v", offset.ToActualOffset(), bodyLength, err)
+	}
+	return n, nil
+}
+
+func (v *Volume) readAppendAtNs(offset Offset) (uint64, error) {
+	n, err := v.readNeedleAt(offset)
+	if err != nil {
+		return 0, err
 	}
 	return n.AppendAtNs, nil
+}
 
+// ErrIncrementalCopyDiverged means the local copy is not a prefix of this
+// replica's records, so an incremental copy cannot resume safely and the
+// backup should be rebuilt from scratch.
+var ErrIncrementalCopyDiverged = fmt.Errorf("local copy diverged from the replica")
+
+// ResumeByLastEntry resumes an incremental copy by index position instead of
+// by appendAtNs, whose stamps differ across replicas for the same needle.
+// The replica's entry at position entryCount-1 must match the backup's last
+// entry in key and size — and cookie, unless it is an index-only tombstone
+// (a remote-tier delete), which has no .dat record to read a cookie from —
+// and its first entryCount entries must hash the same — a boundary match
+// alone is not proof, since replicated writes can land in a different order
+// on this replica. The copy then continues from the replica's next entry
+// with a .dat record; index-only rows ride the index stream, so nothing is
+// skipped or appended twice. indexBound caps the scan to the index size the
+// caller captured, so rows appended after that point stay out of this copy.
+func (v *Volume) ResumeByLastEntry(entryCount uint64, key NeedleId, cookie uint32, size Size, entriesHash uint64, indexBound uint64) (offset Offset, upToDate bool, err error) {
+
+	fileSize := int64(v.IndexFileSize())
+	if fileSize%NeedleMapEntrySize != 0 {
+		err = fmt.Errorf("unexpected file %s.idx size: %d", v.IndexFileName(), fileSize)
+		return
+	}
+	serverCount := uint64(fileSize / NeedleMapEntrySize)
+	if serverCount < entryCount {
+		err = ErrIncrementalCopyDiverged
+		return
+	}
+
+	lastKey, lastOffset, lastSize, e := v.readIndexEntry(int64(entryCount) - 1)
+	if e != nil {
+		err = e
+		return
+	}
+	if lastKey != key || lastSize != size {
+		err = ErrIncrementalCopyDiverged
+		return
+	}
+	if !lastOffset.IsZero() {
+		var n *needle.Needle
+		n, e = v.readNeedleAt(lastOffset)
+		if e != nil {
+			err = e
+			return
+		}
+		if uint32(n.Cookie) != cookie {
+			err = ErrIncrementalCopyDiverged
+			return
+		}
+	}
+
+	prefixHash, e := v.hashIndexEntries(entryCount)
+	if e != nil {
+		err = e
+		return
+	}
+	if prefixHash != entriesHash {
+		err = ErrIncrementalCopyDiverged
+		return
+	}
+
+	if serverCount == entryCount {
+		upToDate = true
+		return
+	}
+	scanEnd := int64(serverCount)
+	if boundRows := int64(indexBound / uint64(NeedleMapEntrySize)); boundRows < scanEnd {
+		scanEnd = boundRows
+	}
+	for i := int64(entryCount); i < scanEnd; i++ {
+		if offset, err = v.readOffsetFromIndex(i); err != nil {
+			return
+		}
+		if !offset.IsZero() {
+			return
+		}
+	}
+	return
 }
 
 // on server side
@@ -190,12 +406,42 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 		// read the appendAtNs for entry m
 		offset, err = v.readOffsetFromIndex(m)
 		if err != nil {
+			err = fmt.Errorf("read entry %d: %v", m, err)
 			return
+		}
+		if offset.IsZero() {
+			leftIndex, _, leftNs, leftErr := v.readLeftNs(m)
+			if leftErr != nil {
+				err = leftErr
+				return
+			}
+			rightIndex, rightOffset, rightNs, rightErr := v.readRightNs(m, entryCount)
+			if rightErr != nil {
+				err = rightErr
+				return
+			}
+			if rightNs <= sinceNs {
+				l = rightIndex
+				if l == entryCount {
+					return Offset{}, true, nil
+				} else {
+					continue
+				}
+			}
+			if sinceNs < leftNs {
+				h = leftIndex + 1
+				continue
+			}
+			return rightOffset, false, nil
+
+		}
+		if offset.IsZero() {
+			return Offset{}, true, nil
 		}
 
 		mNs, nsReadErr := v.readAppendAtNs(offset)
 		if nsReadErr != nil {
-			err = nsReadErr
+			err = fmt.Errorf("read entry %d offset %d: %v", m, offset.ToActualOffset(), nsReadErr)
 			return
 		}
 
@@ -218,15 +464,101 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 
 }
 
-// bytes is of size NeedleMapEntrySize
-func (v *Volume) readOffsetFromIndex(m int64) (Offset, error) {
+func (v *Volume) readRightNs(m, max int64) (index int64, offset Offset, ts uint64, err error) {
+	index = m
+	for offset.IsZero() {
+		index++
+		if index >= max {
+			return
+		}
+		offset, err = v.readOffsetFromIndex(index)
+		if err != nil {
+			err = fmt.Errorf("read left entry at %d: %v", index, err)
+			return
+		}
+	}
+	if !offset.IsZero() {
+		ts, err = v.readAppendAtNs(offset)
+	}
+	return
+}
+
+func (v *Volume) readLeftNs(m int64) (index int64, offset Offset, ts uint64, err error) {
+	index = m
+	for offset.IsZero() {
+		index--
+		if index < 0 {
+			return
+		}
+		offset, err = v.readOffsetFromIndex(index)
+		if err != nil {
+			err = fmt.Errorf("read right entry at %d: %v", index, err)
+			return
+		}
+	}
+	if !offset.IsZero() {
+		ts, err = v.readAppendAtNs(offset)
+	}
+	return
+}
+
+func (v *Volume) readIndexEntry(m int64) (key NeedleId, offset Offset, size Size, err error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 	if v.nm == nil {
-		return Offset{}, io.EOF
+		return 0, Offset{}, 0, io.EOF
 	}
-	_, offset, _, err := v.nm.ReadIndexEntry(m)
+	return v.nm.ReadIndexEntry(m)
+}
+
+// bytes is of size NeedleMapEntrySize
+func (v *Volume) readOffsetFromIndex(m int64) (Offset, error) {
+	_, offset, _, err := v.readIndexEntry(m)
 	return offset, err
+}
+
+// DatSizeCoveredByIndex returns the .dat end of the last record the index
+// rows before indexSize cover, or the superblock size when no row inside the
+// bound names a record. Rows are not always in .dat order — rebuilds can
+// write the .idx sorted by key — so the bound comes from the maximum offset:
+// records do not overlap, so the highest offset names the highest end.
+// Records appended after the index bound — including staged writes whose
+// rows are not published yet — lie past it, so a copy must not stream them:
+// they would reach the backup without their row and be appended again on the
+// next run.
+func (v *Volume) DatSizeCoveredByIndex(indexSize int64) (int64, error) {
+	indexFile, err := os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644)
+	if err != nil {
+		return 0, err
+	}
+	defer indexFile.Close()
+
+	boundRows := indexSize / NeedleMapEntrySize
+	row := int64(0)
+	maxActualOffset := int64(-1)
+	err = idx.WalkIndexFile(indexFile, 0, func(_ NeedleId, offset Offset, _ Size) error {
+		if row >= boundRows {
+			return errStopIdxWalk
+		}
+		row++
+		if !offset.IsZero() {
+			if actualOffset := offset.ToActualOffset(); actualOffset > maxActualOffset {
+				maxActualOffset = actualOffset
+			}
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopIdxWalk) {
+		return 0, err
+	}
+	if maxActualOffset < 0 {
+		return int64(v.SuperBlock.BlockSize()), nil
+	}
+	_, _, bodyLength, err := needle.ReadNeedleHeader(v.DataBackend, v.SuperBlock.Version, maxActualOffset)
+	if err != nil {
+		return 0, err
+	}
+	return maxActualOffset + NeedleHeaderSize + bodyLength, nil
 }
 
 // generate the volume idx

@@ -1,9 +1,13 @@
 package redis2
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/go-redis/redis/v8"
+	"crypto/tls"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/redis_conf"
+	"github.com/seaweedfs/seaweedfs/weed/filer/redis_tls"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -23,22 +27,36 @@ func (store *RedisCluster2Store) Initialize(configuration util.Configuration, pr
 	configuration.SetDefault(prefix+"useReadOnly", false)
 	configuration.SetDefault(prefix+"routeByLatency", false)
 
+	tlsConfig, err := redis_tls.Config(configuration, prefix)
+	if err != nil {
+		return err
+	}
+
 	return store.initialize(
 		configuration.GetStringSlice(prefix+"addresses"),
+		configuration.GetString(prefix+"username"),
 		configuration.GetString(prefix+"password"),
+		configuration.GetString(prefix+"keyPrefix"),
 		configuration.GetBool(prefix+"useReadOnly"),
 		configuration.GetBool(prefix+"routeByLatency"),
 		configuration.GetStringSlice(prefix+"superLargeDirectories"),
+		tlsConfig,
+		redis_conf.Read(configuration, prefix),
 	)
 }
 
-func (store *RedisCluster2Store) initialize(addresses []string, password string, readOnly, routeByLatency bool, superLargeDirectories []string) (err error) {
-	store.Client = redis.NewClusterClient(&redis.ClusterOptions{
+func (store *RedisCluster2Store) initialize(addresses []string, username string, password string, keyPrefix string, readOnly, routeByLatency bool, superLargeDirectories []string, tlsConfig *tls.Config, settings redis_conf.Settings) (err error) {
+	options := &redis.ClusterOptions{
 		Addrs:          addresses,
+		Username:       username,
 		Password:       password,
 		ReadOnly:       readOnly,
 		RouteByLatency: routeByLatency,
-	})
+		TLSConfig:      tlsConfig,
+	}
+	settings.ApplyToCluster(options)
+	store.Client = redis.NewClusterClient(options)
+	store.keyPrefix = keyPrefix
 	store.loadSuperLargeDirectories(superLargeDirectories)
 	return
 }

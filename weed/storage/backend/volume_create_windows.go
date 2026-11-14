@@ -1,14 +1,18 @@
-// +build windows
+//go:build windows
 
 package backend
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/storage/backend/memory_map"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend/memory_map"
 	"golang.org/x/sys/windows"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend/memory_map/os_overloads"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend/memory_map/os_overloads"
 )
+
+// PreallocateSupported reports whether CreateVolumeFile reserves the
+// requested size on this platform.
+const PreallocateSupported = false
 
 func CreateVolumeFile(fileName string, preallocate int64, memoryMapSizeMB uint32) (BackendStorageFile, error) {
 	if preallocate > 0 {

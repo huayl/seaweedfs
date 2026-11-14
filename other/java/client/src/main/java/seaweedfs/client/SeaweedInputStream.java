@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.EOFException;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -18,11 +19,11 @@ public class SeaweedInputStream extends InputStream {
 
     private final FilerClient filerClient;
     private final String path;
-    private final FilerProto.Entry entry;
     private final List<SeaweedRead.VisibleInterval> visibleIntervalList;
     private final long contentLength;
+    private FilerProto.Entry entry;
 
-    private long position = 0;  // cursor of the file
+    private long position = 0; // cursor of the file
 
     private boolean closed = false;
 
@@ -34,8 +35,15 @@ public class SeaweedInputStream extends InputStream {
         this.entry = filerClient.lookupEntry(
                 SeaweedOutputStream.getParentDirectory(fullpath),
                 SeaweedOutputStream.getFileName(fullpath));
-        this.contentLength = SeaweedRead.fileSize(entry);
+        if (entry == null) {
+            throw new FileNotFoundException();
+        }
 
+        if (RemoteUtil.isInRemoteOnly(entry)) {
+            entry = RemoteUtil.downloadRemoteEntry(filerClient, fullpath, entry);
+        }
+
+        this.contentLength = SeaweedRead.fileSize(entry);
         this.visibleIntervalList = SeaweedRead.nonOverlappingVisibleIntervals(filerClient, entry.getChunksList());
 
         LOG.debug("new path:{} entry:{} visibleIntervalList:{}", path, entry, visibleIntervalList);
@@ -49,8 +57,12 @@ public class SeaweedInputStream extends InputStream {
         this.filerClient = filerClient;
         this.path = path;
         this.entry = entry;
-        this.contentLength = SeaweedRead.fileSize(entry);
 
+        if (RemoteUtil.isInRemoteOnly(entry)) {
+            this.entry = RemoteUtil.downloadRemoteEntry(filerClient, path, entry);
+        }
+
+        this.contentLength = SeaweedRead.fileSize(entry);
         this.visibleIntervalList = SeaweedRead.nonOverlappingVisibleIntervals(filerClient, entry.getChunksList());
 
         LOG.debug("new path:{} entry:{} visibleIntervalList:{}", path, entry, visibleIntervalList);
@@ -85,7 +97,8 @@ public class SeaweedInputStream extends InputStream {
             throw new IllegalArgumentException("requested read length is less than zero");
         }
         if (len > (b.length - off)) {
-            throw new IllegalArgumentException("requested read length is more than will fit after requested offset in buffer");
+            throw new IllegalArgumentException(
+                    "requested read length is more than will fit after requested offset in buffer");
         }
 
         ByteBuffer buf = ByteBuffer.wrap(b, off, len);
@@ -100,20 +113,28 @@ public class SeaweedInputStream extends InputStream {
             throw new IllegalArgumentException("attempting to read from negative offset");
         }
         if (position >= contentLength) {
-            return -1;  // Hadoop prefers -1 to EOFException
+            return -1; // Hadoop prefers -1 to EOFException
         }
 
         long bytesRead = 0;
         int len = buf.remaining();
-        int start = (int) this.position;
-        if (start+len <= entry.getContent().size()) {
-            entry.getContent().substring(start, start+len).copyTo(buf);
+        if (this.position < Integer.MAX_VALUE && (this.position + len) <= entry.getContent().size()) {
+            entry.getContent().substring((int) this.position, (int) (this.position + len)).copyTo(buf);
+            bytesRead = len; // FIX: Update bytesRead after inline copy
         } else {
-            bytesRead = SeaweedRead.read(this.filerClient, this.visibleIntervalList, this.position, buf, SeaweedRead.fileSize(entry));
+            // Use the known contentLength instead of recomputing from the entry to avoid
+            // races
+            bytesRead = SeaweedRead.read(this.filerClient, this.visibleIntervalList, this.position, buf,
+                    this.contentLength);
         }
 
         if (bytesRead > Integer.MAX_VALUE) {
             throw new IOException("Unexpected Content-Length");
+        }
+
+        // Clamp premature EOFs: do not return -1 unless position >= contentLength
+        if (bytesRead < 0 && position < contentLength) {
+            bytesRead = 0;
         }
 
         if (bytesRead > 0) {
@@ -175,13 +196,16 @@ public class SeaweedInputStream extends InputStream {
         }
         final long remaining = this.contentLength - this.position;
         return remaining <= Integer.MAX_VALUE
-                ? (int) remaining : Integer.MAX_VALUE;
+                ? (int) remaining
+                : Integer.MAX_VALUE;
     }
 
     /**
-     * Returns the length of the file that this stream refers to. Note that the length returned is the length
-     * as of the time the Stream was opened. Specifically, if there have been subsequent appends to the file,
-     * they wont be reflected in the returned length.
+     * Returns the length of the file that this stream refers to. Note that the
+     * length returned is the length
+     * as of the time the Stream was opened. Specifically, if there have been
+     * subsequent appends to the file,
+     * they won't be reflected in the returned length.
      *
      * @return length of the file.
      * @throws IOException if the stream is closed

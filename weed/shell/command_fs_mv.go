@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -34,7 +34,15 @@ func (c *commandFsMv) Help() string {
 `
 }
 
+func (c *commandFsMv) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsMv) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
 
 	if len(args) != 2 {
 		return fmt.Errorf("need to have 2 arguments")
@@ -54,14 +62,14 @@ func (c *commandFsMv) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 
 	destinationDir, destinationName := util.FullPath(destinationPath).DirAndName()
 
-	return commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	return commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
 		// collect destination entry info
 		destinationRequest := &filer_pb.LookupDirectoryEntryRequest{
-			Name:      destinationDir,
-			Directory: destinationName,
+			Directory: destinationDir,
+			Name:      destinationName,
 		}
-		respDestinationLookupEntry, err := filer_pb.LookupEntry(client, destinationRequest)
+		respDestinationLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, destinationRequest)
 
 		var targetDir, targetName string
 

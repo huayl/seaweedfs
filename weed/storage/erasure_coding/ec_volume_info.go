@@ -1,117 +1,69 @@
 package erasure_coding
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 // data structure used in master
 type EcVolumeInfo struct {
-	VolumeId   needle.VolumeId
-	Collection string
-	ShardBits  ShardBits
-	DiskType   string
+	VolumeId    needle.VolumeId
+	Collection  string
+	DiskType    string
+	DiskId      uint32 // ID of the disk this EC volume is on
+	ExpireAtSec uint64 // ec volume destroy time, calculated from the ec volume was created
+	ShardsInfo  *ShardsInfo
+	FileCount   uint64 // live needle count for this EC volume (same on every node holding shards)
+	DeleteCount uint64 // tombstoned needle count for this EC volume
+	EncodeTsNs  int64  // encode-run identity (unix nanos); one value per (volume, disk)
 }
 
-func NewEcVolumeInfo(diskType string, collection string, vid needle.VolumeId, shardBits ShardBits) *EcVolumeInfo {
-	return &EcVolumeInfo{
-		Collection: collection,
-		VolumeId:   vid,
-		ShardBits:  shardBits,
-		DiskType:   diskType,
-	}
-}
-
-func (ecInfo *EcVolumeInfo) AddShardId(id ShardId) {
-	ecInfo.ShardBits = ecInfo.ShardBits.AddShardId(id)
-}
-
-func (ecInfo *EcVolumeInfo) RemoveShardId(id ShardId) {
-	ecInfo.ShardBits = ecInfo.ShardBits.RemoveShardId(id)
-}
-
-func (ecInfo *EcVolumeInfo) HasShardId(id ShardId) bool {
-	return ecInfo.ShardBits.HasShardId(id)
-}
-
-func (ecInfo *EcVolumeInfo) ShardIds() (ret []ShardId) {
-	return ecInfo.ShardBits.ShardIds()
-}
-
-func (ecInfo *EcVolumeInfo) ShardIdCount() (count int) {
-	return ecInfo.ShardBits.ShardIdCount()
+// DataShardsOrDefault returns how many of this volume's shards hold data; shard
+// ids below it are data, the rest are parity. Open-source SeaweedFS always uses
+// the fixed 10+4 layout, so this returns DataShardsCount. It is a per-volume
+// accessor, like EcShardsVolumeDataShards, so callers stay correct on builds
+// that derive the ratio per volume.
+func (ecInfo *EcVolumeInfo) DataShardsOrDefault() int {
+	return DataShardsCount
 }
 
 func (ecInfo *EcVolumeInfo) Minus(other *EcVolumeInfo) *EcVolumeInfo {
-	ret := &EcVolumeInfo{
-		VolumeId:   ecInfo.VolumeId,
-		Collection: ecInfo.Collection,
-		ShardBits:  ecInfo.ShardBits.Minus(other.ShardBits),
-		DiskType:   ecInfo.DiskType,
-	}
-
-	return ret
-}
-
-func (ecInfo *EcVolumeInfo) ToVolumeEcShardInformationMessage() (ret *master_pb.VolumeEcShardInformationMessage) {
-	return &master_pb.VolumeEcShardInformationMessage{
-		Id:          uint32(ecInfo.VolumeId),
-		EcIndexBits: uint32(ecInfo.ShardBits),
+	return &EcVolumeInfo{
+		VolumeId:    ecInfo.VolumeId,
 		Collection:  ecInfo.Collection,
+		ShardsInfo:  ecInfo.ShardsInfo.Minus(other.ShardsInfo),
 		DiskType:    ecInfo.DiskType,
+		DiskId:      ecInfo.DiskId,
+		ExpireAtSec: ecInfo.ExpireAtSec,
+		FileCount:   ecInfo.FileCount,
+		DeleteCount: ecInfo.DeleteCount,
+		EncodeTsNs:  ecInfo.EncodeTsNs,
 	}
 }
 
-type ShardBits uint32 // use bits to indicate the shard id, use 32 bits just for possible future extension
-
-func (b ShardBits) AddShardId(id ShardId) ShardBits {
-	return b | (1 << id)
-}
-
-func (b ShardBits) RemoveShardId(id ShardId) ShardBits {
-	return b &^ (1 << id)
-}
-
-func (b ShardBits) HasShardId(id ShardId) bool {
-	return b&(1<<id) > 0
-}
-
-func (b ShardBits) ShardIds() (ret []ShardId) {
-	for i := ShardId(0); i < TotalShardsCount; i++ {
-		if b.HasShardId(i) {
-			ret = append(ret, i)
-		}
+func (evi *EcVolumeInfo) ToVolumeEcShardInformationMessage() (ret *master_pb.VolumeEcShardInformationMessage) {
+	return &master_pb.VolumeEcShardInformationMessage{
+		Id:          uint32(evi.VolumeId),
+		EcIndexBits: evi.ShardsInfo.Bitmap(),
+		ShardSizes:  evi.ShardsInfo.SizesInt64(),
+		Collection:  evi.Collection,
+		DiskType:    evi.DiskType,
+		ExpireAtSec: evi.ExpireAtSec,
+		DiskId:      evi.DiskId,
+		FileCount:   evi.FileCount,
+		DeleteCount: evi.DeleteCount,
+		EncodeTsNs:  evi.EncodeTsNs,
 	}
-	return
 }
 
-func (b ShardBits) ToUint32Slice() (ret []uint32) {
-	for i := uint32(0); i < TotalShardsCount; i++ {
-		if b.HasShardId(ShardId(i)) {
-			ret = append(ret, i)
-		}
-	}
-	return
+func (evi *EcVolumeInfo) GetCollection() string {
+	return evi.Collection
 }
 
-func (b ShardBits) ShardIdCount() (count int) {
-	for count = 0; b > 0; count++ {
-		b &= b - 1
-	}
-	return
+func (evi *EcVolumeInfo) GetVolumeId() needle.VolumeId {
+	return evi.VolumeId
 }
 
-func (b ShardBits) Minus(other ShardBits) ShardBits {
-	return b &^ other
-}
-
-func (b ShardBits) Plus(other ShardBits) ShardBits {
-	return b | other
-}
-
-func (b ShardBits) MinusParityShards() ShardBits {
-	for i := DataShardsCount; i < TotalShardsCount; i++ {
-		b = b.RemoveShardId(ShardId(i))
-	}
-	return b
+func (evi *EcVolumeInfo) GetRemoteStorageName() string {
+	return ""
 }

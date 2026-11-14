@@ -4,7 +4,6 @@ import com.google.common.base.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -14,8 +13,14 @@ public class FilerClient extends FilerGrpcClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(FilerClient.class);
 
-    public FilerClient(String host, int grpcPort) {
-        super(host, grpcPort);
+    public FilerClient(String filerHost, int filerGrpcPort) {
+        this(filerHost, filerGrpcPort-10000, filerGrpcPort, "");
+    }
+    public FilerClient(String filerHost, int filerGrpcPort, String cn) { this(filerHost, filerGrpcPort-10000, filerGrpcPort, cn); }
+    public FilerClient(String filerHost, int filerPort, int filerGrpcPort) { this(filerHost, filerPort, filerGrpcPort, ""); }
+
+    public FilerClient(String filerHost, int filerPort, int filerGrpcPort, String cn) {
+        super(filerHost, filerPort, filerGrpcPort, cn);
     }
 
     public static String toFileId(FilerProto.FileId fid) {
@@ -59,24 +64,39 @@ public class FilerClient extends FilerGrpcClient {
 
     public static FilerProto.Entry afterEntryDeserialization(FilerProto.Entry entry) {
         if (entry.getChunksList().size() <= 0) {
-            return entry;
-        }
-        String fileId = entry.getChunks(0).getFileId();
-        if (fileId != null && fileId.length() != 0) {
-            return entry;
-        }
-        FilerProto.Entry.Builder entryBuilder = entry.toBuilder();
-        entryBuilder.clearChunks();
-        for (FilerProto.FileChunk chunk : entry.getChunksList()) {
-            FilerProto.FileChunk.Builder chunkBuilder = chunk.toBuilder();
-            chunkBuilder.setFileId(toFileId(chunk.getFid()));
-            String sourceFileId = toFileId(chunk.getSourceFid());
-            if (sourceFileId != null) {
-                chunkBuilder.setSourceFileId(sourceFileId);
+            if (entry.getContent().isEmpty()) {
+                return entry;
+            } else {
+                if (entry.getAttributes().getFileSize() <= 0) {
+                    FilerProto.Entry.Builder entryBuilder = entry.toBuilder();
+                    FilerProto.FuseAttributes.Builder attrBuilder = entry.getAttributes().toBuilder();
+                    attrBuilder.setFileSize(entry.getContent().size());
+                    entryBuilder.setAttributes(attrBuilder);
+                    return entryBuilder.build();
+                }
             }
-            entryBuilder.addChunks(chunkBuilder);
+            return entry;
+        } else {
+            FilerProto.Entry.Builder entryBuilder = entry.toBuilder();
+            entryBuilder.clearChunks();
+            long fileSize = 0;
+            for (FilerProto.FileChunk chunk : entry.getChunksList()) {
+                fileSize = Math.max(fileSize, chunk.getOffset()+chunk.getSize());
+                FilerProto.FileChunk.Builder chunkBuilder = chunk.toBuilder();
+                chunkBuilder.setFileId(toFileId(chunk.getFid()));
+                String sourceFileId = toFileId(chunk.getSourceFid());
+                if (sourceFileId != null) {
+                    chunkBuilder.setSourceFileId(sourceFileId);
+                }
+                entryBuilder.addChunks(chunkBuilder);
+            }
+            if (entry.getAttributes().getFileSize() <= 0) {
+                FilerProto.FuseAttributes.Builder attrBuilder = entry.getAttributes().toBuilder();
+                attrBuilder.setFileSize(fileSize);
+                entryBuilder.setAttributes(attrBuilder);
+            }
+            return entryBuilder.build();
         }
-        return entryBuilder.build();
     }
 
     public boolean mkdirs(String path, int mode) {
@@ -93,9 +113,9 @@ public class FilerClient extends FilerGrpcClient {
         if ("/".equals(path)) {
             return true;
         }
-        File pathFile = new File(path);
-        String parent = pathFile.getParent().replace('\\','/');
-        String name = pathFile.getName();
+        String[] dirAndName = SeaweedUtil.toDirAndName(path);
+        String parent = dirAndName[0];
+        String name = dirAndName[1];
 
         mkdirs(parent, mode, uid, gid, userName, groupNames);
 
@@ -114,23 +134,32 @@ public class FilerClient extends FilerGrpcClient {
 
     public boolean mv(String oldPath, String newPath) {
 
-        File oldPathFile = new File(oldPath);
-        String oldParent = oldPathFile.getParent().replace('\\','/');
-        String oldName = oldPathFile.getName();
+        String[] oldDirAndName = SeaweedUtil.toDirAndName(oldPath);
+        String oldParent = oldDirAndName[0];
+        String oldName = oldDirAndName[1];
 
-        File newPathFile = new File(newPath);
-        String newParent = newPathFile.getParent().replace('\\','/');
-        String newName = newPathFile.getName();
+        String[] newDirAndName = SeaweedUtil.toDirAndName(newPath);
+        String newParent = newDirAndName[0];
+        String newName = newDirAndName[1];
 
         return atomicRenameEntry(oldParent, oldName, newParent, newName);
 
     }
 
+    public boolean exists(String path){
+
+        String[] dirAndName = SeaweedUtil.toDirAndName(path);
+        String parent = dirAndName[0];
+        String entryName = dirAndName[1];
+
+        return lookupEntry(parent, entryName) != null;
+    }
+
     public boolean rm(String path, boolean isRecursive, boolean ignoreRecusiveError) {
 
-        File pathFile = new File(path);
-        String parent = pathFile.getParent().replace('\\','/');
-        String name = pathFile.getName();
+        String[] dirAndName = SeaweedUtil.toDirAndName(path);
+        String parent = dirAndName[0];
+        String name = dirAndName[1];
 
         return deleteEntry(
                 parent,
@@ -141,31 +170,43 @@ public class FilerClient extends FilerGrpcClient {
     }
 
     public boolean touch(String path, int mode) {
+
         String currentUser = System.getProperty("user.name");
-        return touch(path, mode, 0, 0, currentUser, new String[]{});
+
+        long now = System.currentTimeMillis() / 1000L;
+        return touch(path, now, mode, 0, 0, currentUser, new String[]{});
+
     }
 
-    public boolean touch(String path, int mode, int uid, int gid, String userName, String[] groupNames) {
+    public boolean touch(String path, long modifiedTimeSecond, int mode, int uid, int gid, String userName, String[] groupNames) {
 
-        File pathFile = new File(path);
-        String parent = pathFile.getParent().replace('\\','/');
-        String name = pathFile.getName();
+        String[] dirAndName = SeaweedUtil.toDirAndName(path);
+        String parent = dirAndName[0];
+        String name = dirAndName[1];
 
         FilerProto.Entry entry = lookupEntry(parent, name);
         if (entry == null) {
             return createEntry(
                     parent,
-                    newFileEntry(name, mode, uid, gid, userName, groupNames).build()
+                    newFileEntry(name, modifiedTimeSecond, mode, uid, gid, userName, groupNames).build()
             );
         }
-        long now = System.currentTimeMillis() / 1000L;
-        FilerProto.FuseAttributes.Builder attr = entry.getAttributes().toBuilder()
-                .setMtime(now)
-                .setUid(uid)
-                .setGid(gid)
-                .setUserName(userName)
-                .clearGroupName()
-                .addAllGroupName(Arrays.asList(groupNames));
+        FilerProto.FuseAttributes.Builder attr = entry.getAttributes().toBuilder();
+        if (modifiedTimeSecond>0) {
+            attr.setMtime(modifiedTimeSecond);
+        }
+        if (uid>0) {
+            attr.setUid(uid);
+        }
+        if (gid>0) {
+            attr.setGid(gid);
+        }
+        if (userName!=null) {
+            attr.setUserName(userName);
+        }
+        if (groupNames!=null) {
+            attr.clearGroupName().addAllGroupName(Arrays.asList(groupNames));
+        }
         return updateEntry(parent, entry.toBuilder().setAttributes(attr).build());
     }
 
@@ -188,17 +229,15 @@ public class FilerClient extends FilerGrpcClient {
                         .addAllGroupName(Arrays.asList(groupNames)));
     }
 
-    public FilerProto.Entry.Builder newFileEntry(String name, int mode,
+    public FilerProto.Entry.Builder newFileEntry(String name, long modifiedTimeSecond, int mode,
                                                  int uid, int gid, String userName, String[] groupNames) {
-
-        long now = System.currentTimeMillis() / 1000L;
 
         return FilerProto.Entry.newBuilder()
                 .setName(name)
                 .setIsDirectory(false)
                 .setAttributes(FilerProto.FuseAttributes.newBuilder()
-                        .setMtime(now)
-                        .setCrtime(now)
+                        .setMtime(modifiedTimeSecond)
+                        .setCrtime(modifiedTimeSecond)
                         .setUid(uid)
                         .setGid(gid)
                         .setFileMode(mode)
@@ -331,6 +370,7 @@ public class FilerClient extends FilerGrpcClient {
                 .setPathPrefix(prefix)
                 .setClientName(clientName)
                 .setSinceNs(sinceNs)
+                .setClientId(this.randomClientId)
                 .build()
         );
     }

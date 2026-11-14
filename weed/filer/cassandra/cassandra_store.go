@@ -2,13 +2,16 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/gocql/gocql"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -32,6 +35,8 @@ func (store *CassandraStore) Initialize(configuration util.Configuration, prefix
 		configuration.GetString(prefix+"username"),
 		configuration.GetString(prefix+"password"),
 		configuration.GetStringSlice(prefix+"superLargeDirectories"),
+		configuration.GetString(prefix+"localDC"),
+		configuration.GetInt(prefix+"connection_timeout_millisecond"),
 	)
 }
 
@@ -40,13 +45,21 @@ func (store *CassandraStore) isSuperLargeDirectory(dir string) (dirHash string, 
 	return
 }
 
-func (store *CassandraStore) initialize(keyspace string, hosts []string, username string, password string, superLargeDirectories []string) (err error) {
+func (store *CassandraStore) initialize(keyspace string, hosts []string, username string, password string, superLargeDirectories []string, localDC string, timeout int) (err error) {
 	store.cluster = gocql.NewCluster(hosts...)
 	if username != "" && password != "" {
 		store.cluster.Authenticator = gocql.PasswordAuthenticator{Username: username, Password: password}
 	}
 	store.cluster.Keyspace = keyspace
+	store.cluster.Timeout = time.Duration(timeout) * time.Millisecond
+	glog.V(0).Infof("timeout = %d", timeout)
+	fallback := gocql.RoundRobinHostPolicy()
+	if localDC != "" {
+		fallback = gocql.DCAwareRoundRobinPolicy(localDC)
+	}
+	store.cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(fallback)
 	store.cluster.Consistency = gocql.LocalQuorum
+
 	store.session, err = store.cluster.CreateSession()
 	if err != nil {
 		glog.V(0).Infof("Failed to open cassandra store, hosts %v, keyspace %s", hosts, keyspace)
@@ -89,7 +102,7 @@ func (store *CassandraStore) InsertEntry(ctx context.Context, entry *filer.Entry
 		return fmt.Errorf("encode %s: %s", entry.FullPath, err)
 	}
 
-	if len(entry.Chunks) > 50 {
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		meta = util.MaybeGzipData(meta)
 	}
 
@@ -117,14 +130,11 @@ func (store *CassandraStore) FindEntry(ctx context.Context, fullpath util.FullPa
 	var data []byte
 	if err := store.session.Query(
 		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Consistency(gocql.One).Scan(&data); err != nil {
-		if err != gocql.ErrNotFound {
+		dir, name).Scan(&data); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer_pb.ErrNotFound
 		}
-	}
-
-	if len(data) == 0 {
-		return nil, filer_pb.ErrNotFound
+		return nil, err
 	}
 
 	entry = &filer.Entry{
@@ -193,15 +203,26 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		lastFileName = name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc for entry %q: %w", entry.FullPath, resEachEntryFuncErr)
+			glog.V(0).InfofCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", entry.FullPath, resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}
-	if err := iter.Close(); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+	if errClose := iter.Close(); errClose != nil {
+		glog.V(0).InfofCtx(ctx, "list iterator close: %v", errClose)
+		if err == nil {
+			return lastFileName, errClose
+		}
 	}
 
 	return lastFileName, err

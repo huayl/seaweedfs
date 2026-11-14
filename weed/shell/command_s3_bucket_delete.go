@@ -1,11 +1,13 @@
 package shell
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_objectlock"
 )
 
 func init() {
@@ -26,12 +28,16 @@ func (c *commandS3BucketDelete) Help() string {
 `
 }
 
+func (c *commandS3BucketDelete) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	bucketName := bucketCommand.String("name", "", "bucket name")
 	if err = bucketCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 
 	if *bucketName == "" {
@@ -46,9 +52,18 @@ func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer
 	var filerBucketsPath string
 	filerBucketsPath, err = readFilerBucketsPath(commandEnv)
 	if err != nil {
-		return fmt.Errorf("read buckets: %v", err)
+		return fmt.Errorf("read buckets: %w", err)
 	}
 
-	return filer_pb.Remove(commandEnv, filerBucketsPath, *bucketName, false, true, true, false, nil)
+	// Check if bucket has Object Lock enabled and if there are locked objects
+	ctx := context.Background()
+	err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return s3_objectlock.CheckBucketForLockedObjects(ctx, client, filerBucketsPath, *bucketName)
+	})
+	if err != nil {
+		return err
+	}
+
+	return filer_pb.Remove(ctx, commandEnv, filerBucketsPath, *bucketName, false, true, true, false, nil)
 
 }

@@ -5,20 +5,25 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
 	DIR_LIST_MARKER = "\x00"
+
+	// a listing whose callback stops early reads at most one batch more than
+	// it uses, and no single pipeline grows with the listing limit
+	listFetchBatchSize = 128
 )
 
 type UniversalRedis2Store struct {
 	Client                  redis.UniversalClient
+	keyPrefix               string
 	superLargeDirectoryHash map[string]bool
 }
 
@@ -35,6 +40,13 @@ func (store *UniversalRedis2Store) loadSuperLargeDirectories(superLargeDirectori
 	}
 }
 
+func (store *UniversalRedis2Store) getKey(key string) string {
+	if store.keyPrefix == "" {
+		return key
+	}
+	return store.keyPrefix + key
+}
+
 func (store *UniversalRedis2Store) BeginTransaction(ctx context.Context) (context.Context, error) {
 	return ctx, nil
 }
@@ -47,17 +59,8 @@ func (store *UniversalRedis2Store) RollbackTransaction(ctx context.Context) erro
 
 func (store *UniversalRedis2Store) InsertEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
-	value, err := entry.EncodeAttributesAndChunks()
-	if err != nil {
-		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
-	}
-
-	if len(entry.Chunks) > 50 {
-		value = util.MaybeGzipData(value)
-	}
-
-	if err = store.Client.Set(ctx, string(entry.FullPath), value, time.Duration(entry.TtlSec)*time.Second).Err(); err != nil {
-		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
+	if err = store.doInsertEntry(ctx, entry); err != nil {
+		return err
 	}
 
 	dir, name := entry.FullPath.DirAndName()
@@ -66,7 +69,7 @@ func (store *UniversalRedis2Store) InsertEntry(ctx context.Context, entry *filer
 	}
 
 	if name != "" {
-		if err = store.Client.ZAddNX(ctx, genDirectoryListKey(dir), &redis.Z{Score: 0, Member: name}).Err(); err != nil {
+		if err = store.Client.ZAddNX(ctx, store.getKey(genDirectoryListKey(dir)), redis.Z{Score: 0, Member: name}).Err(); err != nil {
 			return fmt.Errorf("persisting %s in parent dir: %v", entry.FullPath, err)
 		}
 	}
@@ -74,14 +77,35 @@ func (store *UniversalRedis2Store) InsertEntry(ctx context.Context, entry *filer
 	return nil
 }
 
+func (store *UniversalRedis2Store) doInsertEntry(ctx context.Context, entry *filer.Entry) error {
+	value, err := entry.EncodeAttributesAndChunks()
+	if err != nil {
+		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
+	}
+
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
+		value = util.MaybeGzipData(value)
+	}
+
+	if err = store.Client.Set(ctx, store.getKey(string(entry.FullPath)), value, time.Duration(entry.TtlSec)*time.Second).Err(); err != nil {
+		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
+	}
+	return nil
+}
+
 func (store *UniversalRedis2Store) UpdateEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
-	return store.InsertEntry(ctx, entry)
+	return store.doInsertEntry(ctx, entry)
 }
 
 func (store *UniversalRedis2Store) FindEntry(ctx context.Context, fullpath util.FullPath) (entry *filer.Entry, err error) {
 
-	data, err := store.Client.Get(ctx, string(fullpath)).Result()
+	return decodeEntry(fullpath, store.Client.Get(ctx, store.getKey(string(fullpath))))
+}
+
+func decodeEntry(fullpath util.FullPath, get *redis.StringCmd) (entry *filer.Entry, err error) {
+
+	data, err := get.Result()
 	if err == redis.Nil {
 		return nil, filer_pb.ErrNotFound
 	}
@@ -103,12 +127,11 @@ func (store *UniversalRedis2Store) FindEntry(ctx context.Context, fullpath util.
 
 func (store *UniversalRedis2Store) DeleteEntry(ctx context.Context, fullpath util.FullPath) (err error) {
 
-	_, err = store.Client.Del(ctx, genDirectoryListKey(string(fullpath))).Result()
-	if err != nil {
-		return fmt.Errorf("delete dir list %s : %v", fullpath, err)
-	}
-
-	_, err = store.Client.Del(ctx, string(fullpath)).Result()
+	// The child listing is dropped by DeleteFolderChildren, together with the
+	// children it describes. Dropping it here would also discard an entry that
+	// arrived after the caller judged this directory empty, and nothing else
+	// records that the entry is there.
+	_, err = store.Client.Del(ctx, store.getKey(string(fullpath))).Result()
 	if err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
@@ -118,7 +141,7 @@ func (store *UniversalRedis2Store) DeleteEntry(ctx context.Context, fullpath uti
 		return nil
 	}
 	if name != "" {
-		_, err = store.Client.ZRem(ctx, genDirectoryListKey(dir), name).Result()
+		_, err = store.Client.ZRem(ctx, store.getKey(genDirectoryListKey(dir)), name).Result()
 		if err != nil {
 			return fmt.Errorf("DeleteEntry %s in parent dir: %v", fullpath, err)
 		}
@@ -133,17 +156,27 @@ func (store *UniversalRedis2Store) DeleteFolderChildren(ctx context.Context, ful
 		return nil
 	}
 
-	members, err := store.Client.ZRange(ctx, genDirectoryListKey(string(fullpath)), 0, -1).Result()
+	dirListKey := store.getKey(genDirectoryListKey(string(fullpath)))
+	members, err := store.Client.ZRangeByLex(ctx, dirListKey, &redis.ZRangeBy{
+		Min: "-",
+		Max: "+",
+	}).Result()
 	if err != nil {
 		return fmt.Errorf("DeleteFolderChildren %s : %v", fullpath, err)
 	}
 
 	for _, fileName := range members {
 		path := util.NewFullPath(string(fullpath), fileName)
-		_, err = store.Client.Del(ctx, string(path)).Result()
+		_, err = store.Client.Del(ctx, store.getKey(string(path))).Result()
 		if err != nil {
 			return fmt.Errorf("DeleteFolderChildren %s in parent dir: %v", fullpath, err)
 		}
+		// not efficient, but need to remove if it is a directory
+		store.Client.Del(ctx, store.getKey(genDirectoryListKey(string(path))))
+	}
+
+	if _, err = store.Client.Del(ctx, dirListKey).Result(); err != nil {
+		return fmt.Errorf("DeleteFolderChildren %s list: %v", fullpath, err)
 	}
 
 	return nil
@@ -155,44 +188,174 @@ func (store *UniversalRedis2Store) ListDirectoryPrefixedEntries(ctx context.Cont
 
 func (store *UniversalRedis2Store) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
 
-	dirListKey := genDirectoryListKey(string(dirPath))
-	start := int64(0)
+	dirListKey := store.getKey(genDirectoryListKey(string(dirPath)))
+
+	min := "-"
 	if startFileName != "" {
-		start, _ = store.Client.ZRank(ctx, dirListKey, startFileName).Result()
-		if !includeStartFile {
-			start++
+		if includeStartFile {
+			min = "[" + startFileName
+		} else {
+			min = "(" + startFileName
 		}
 	}
-	members, err := store.Client.ZRange(ctx, dirListKey, start, start+int64(limit)-1).Result()
+
+	members, err := store.Client.ZRangeByLex(ctx, dirListKey, &redis.ZRangeBy{
+		Min:    min,
+		Max:    "+",
+		Offset: 0,
+		Count:  limit,
+	}).Result()
 	if err != nil {
 		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
 	}
 
 	// fetch entry meta
-	for _, fileName := range members {
+	var entry *filer.Entry
+	var gets []*redis.StringCmd
+	for i, fileName := range members {
+		if i%listFetchBatchSize == 0 {
+			gets = store.getEntries(ctx, dirPath, members[i:])
+		}
 		path := util.NewFullPath(string(dirPath), fileName)
-		entry, err := store.FindEntry(ctx, path)
+		entry, err = decodeEntry(path, gets[i%listFetchBatchSize])
 		lastFileName = fileName
 		if err != nil {
-			glog.V(0).Infof("list %s : %v", path, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", path, err)
 			if err == filer_pb.ErrNotFound {
+				store.removeOrphanedDirectoryListMember(ctx, dirPath, fileName)
+				err = nil
 				continue
 			}
+			break
 		} else {
-			if entry.TtlSec > 0 {
-				if entry.Attr.Crtime.Add(time.Duration(entry.TtlSec) * time.Second).Before(time.Now()) {
-					store.Client.Del(ctx, string(path)).Result()
-					store.Client.ZRem(ctx, dirListKey, fileName).Result()
-					continue
-				}
+			if isLogicallyExpired(entry) {
+				store.deleteExpiredEntry(ctx, dirPath, path, fileName)
+				continue
 			}
-			if !eachEntryFunc(entry) {
+
+			resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+			if resEachEntryFuncErr != nil {
+				err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
+				break
+			}
+
+			if !resEachEntryFunc {
 				break
 			}
 		}
 	}
 
 	return lastFileName, err
+}
+
+// getEntries pipelines the GETs for up to listFetchBatchSize of members. Each
+// command keeps its own error, so a missing value still reads as redis.Nil and
+// fails only that member.
+func (store *UniversalRedis2Store) getEntries(ctx context.Context, dirPath util.FullPath, members []string) []*redis.StringCmd {
+	if len(members) > listFetchBatchSize {
+		members = members[:listFetchBatchSize]
+	}
+	gets := make([]*redis.StringCmd, len(members))
+	store.Client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, fileName := range members {
+			gets[i] = pipe.Get(ctx, store.getKey(string(util.NewFullPath(string(dirPath), fileName))))
+		}
+		return nil
+	})
+	return gets
+}
+
+func (store *UniversalRedis2Store) removeOrphanedDirectoryListMember(ctx context.Context, dirPath util.FullPath, fileName string) {
+	// a directory converted to super large after accumulating members still has a legacy index
+	if store.isSuperLargeDirectory(string(dirPath)) {
+		return
+	}
+
+	// survive the listing request being canceled mid-repair
+	ctx = context.WithoutCancel(ctx)
+
+	dirListKey := store.getKey(genDirectoryListKey(string(dirPath)))
+	path := util.NewFullPath(string(dirPath), fileName)
+
+	if err := store.Client.ZRem(ctx, dirListKey, fileName).Err(); err != nil {
+		return
+	}
+
+	// InsertEntry writes the value before adding the member, so a value present
+	// again here may belong to an insert that found the member still in place
+	// and whose ZAddNX was therefore a no-op.
+	exists, err := store.existsOnMaster(ctx, store.getKey(string(path)))
+	if err == nil && exists == 0 {
+		// an evicted directory may still have a live child index; empty zsets self-delete,
+		// so a present index holds children a recursive delete still needs to reach
+		children, childrenErr := store.existsOnMaster(ctx, store.getKey(genDirectoryListKey(string(path))))
+		if childrenErr == nil && children == 0 {
+			return
+		}
+	}
+
+	if err := store.Client.ZAddNX(ctx, dirListKey, redis.Z{Score: 0, Member: fileName}).Err(); err != nil {
+		glog.V(0).InfofCtx(ctx, "restore %s in %s: %v", fileName, dirPath, err)
+	}
+}
+
+var existsScript = redis.NewScript(`return redis.call('EXISTS', KEYS[1])`)
+
+// replica-routed clients (useReadOnly, routeByLatency) would run a plain EXISTS on a lagging
+// replica and misread a live value as absent, turning the repair destructive; a script always
+// runs on the key's master
+func (store *UniversalRedis2Store) existsOnMaster(ctx context.Context, key string) (int64, error) {
+	return existsScript.Run(ctx, store.Client, []string{key}).Int64()
+}
+
+func isLogicallyExpired(entry *filer.Entry) bool {
+	return entry.TtlSec > 0 && entry.Attr.Crtime.Add(time.Duration(entry.TtlSec)*time.Second).Before(time.Now())
+}
+
+// deletes the value only when it still holds exactly the bytes the expiry decision was made on;
+// single-key, so it runs on all transports where a multi-key script would be CROSSSLOT.
+// -1: already gone, 0: changed under us, 1: deleted
+var deleteIfUnchangedScript = redis.NewScript(`
+local v = redis.call('GET', KEYS[1])
+if v == false then
+	return -1
+end
+if v == ARGV[1] then
+	return redis.call('DEL', KEYS[1])
+end
+return 0`)
+
+func (store *UniversalRedis2Store) deleteExpiredEntry(ctx context.Context, dirPath util.FullPath, path util.FullPath, fileName string) {
+	// survive the listing request being canceled mid-delete
+	ctx = context.WithoutCancel(ctx)
+	valueKey := store.getKey(string(path))
+
+	// re-read so the delete can be conditioned on exactly the bytes checked
+	data, err := store.Client.Get(ctx, valueKey).Bytes()
+	if err == redis.Nil {
+		store.removeOrphanedDirectoryListMember(ctx, dirPath, fileName)
+		return
+	}
+	if err != nil {
+		return
+	}
+
+	entry := &filer.Entry{FullPath: path}
+	if err := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data)); err != nil {
+		return
+	}
+	if !isLogicallyExpired(entry) {
+		// a concurrent insert recreated it
+		return
+	}
+
+	// 0 means a concurrent recreate changed the value: keep it. -1 means the redis
+	// TTL won after the re-read: the member still needs the not-found repair.
+	deleted, err := deleteIfUnchangedScript.Run(ctx, store.Client, []string{valueKey}, data).Int()
+	if err != nil || deleted == 0 {
+		return
+	}
+	store.removeOrphanedDirectoryListMember(ctx, dirPath, fileName)
 }
 
 func genDirectoryListKey(dir string) (dirList string) {

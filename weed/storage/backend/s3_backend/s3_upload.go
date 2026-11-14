@@ -3,18 +3,19 @@ package s3_backend
 import (
 	"fmt"
 	"os"
-	"sync/atomic"
+	"sync"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
-func uploadToS3(sess s3iface.S3API, filename string, destBucket string, destKey string,
-	attributes map[string]string,
-	fn func(progressed int64, percentage float32) error) (fileSize int64, err error) {
+func uploadToS3(sess s3iface.S3API, filename string, destBucket string, destKey string, storageClass string, fn func(progressed int64, percentage float32) error, concurrency int) (fileSize int64, err error) {
+	if concurrency <= 0 {
+		concurrency = defaultUploadConcurrency
+	}
 
 	//open the file
 	f, err := os.Open(filename)
@@ -38,35 +39,23 @@ func uploadToS3(sess s3iface.S3API, filename string, destBucket string, destKey 
 	// Create an uploader with the session and custom options
 	uploader := s3manager.NewUploaderWithClient(sess, func(u *s3manager.Uploader) {
 		u.PartSize = partSize
-		u.Concurrency = 5
+		u.Concurrency = concurrency
 	})
 
 	fileReader := &s3UploadProgressedReader{
-		fp:   f,
-		size: fileSize,
-		read: -fileSize,
-		fn:   fn,
-	}
-
-	// process tagging
-	tags := ""
-	for k, v := range attributes {
-		if len(tags) > 0 {
-			tags = tags + "&"
-		}
-		tags = tags + k + "=" + v
+		fp:      f,
+		size:    fileSize,
+		signMap: map[int64]struct{}{},
+		fn:      fn,
 	}
 
 	// Upload the file to S3.
 	var result *s3manager.UploadOutput
 	result, err = uploader.Upload(&s3manager.UploadInput{
-		Bucket:               aws.String(destBucket),
-		Key:                  aws.String(destKey),
-		Body:                 fileReader,
-		ACL:                  aws.String("private"),
-		ServerSideEncryption: aws.String("AES256"),
-		StorageClass:         aws.String("STANDARD_IA"),
-		Tagging:              aws.String(tags),
+		Bucket:       aws.String(destBucket),
+		Key:          aws.String(destKey),
+		Body:         fileReader,
+		StorageClass: aws.String(storageClass),
 	})
 
 	//in case it fails to upload
@@ -79,11 +68,14 @@ func uploadToS3(sess s3iface.S3API, filename string, destBucket string, destKey 
 }
 
 // adapted from https://github.com/aws/aws-sdk-go/pull/1868
+// https://github.com/aws/aws-sdk-go/blob/main/example/service/s3/putObjectWithProcess/putObjWithProcess.go
 type s3UploadProgressedReader struct {
-	fp   *os.File
-	size int64
-	read int64
-	fn   func(progressed int64, percentage float32) error
+	fp      *os.File
+	size    int64
+	read    int64
+	signMap map[int64]struct{}
+	mux     sync.Mutex
+	fn      func(progressed int64, percentage float32) error
 }
 
 func (r *s3UploadProgressedReader) Read(p []byte) (int, error) {
@@ -96,8 +88,14 @@ func (r *s3UploadProgressedReader) ReadAt(p []byte, off int64) (int, error) {
 		return n, err
 	}
 
-	// Got the length have read( or means has uploaded), and you can construct your message
-	atomic.AddInt64(&r.read, int64(n))
+	r.mux.Lock()
+	// Ignore the first signature call
+	if _, ok := r.signMap[off]; ok {
+		r.read += int64(n)
+	} else {
+		r.signMap[off] = struct{}{}
+	}
+	r.mux.Unlock()
 
 	if r.fn != nil {
 		read := r.read

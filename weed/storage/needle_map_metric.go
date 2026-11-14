@@ -2,12 +2,15 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync/atomic"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/willf/bloom"
+	"github.com/cespare/xxhash/v2"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
+	boom "github.com/tylertreat/BoomFilters"
 )
 
 type mapMetric struct {
@@ -16,6 +19,30 @@ type mapMetric struct {
 	DeletionByteCounter uint64 `json:"DeletionByteCounter"`
 	FileByteCounter     uint64 `json:"FileByteCounter"`
 	MaximumFileKey      uint64 `json:"MaxFileKey"`
+	// MaximumNeedleEnd is the largest (offset.ToActualOffset() +
+	// GetActualSize(size, version)) seen during the index walk. It is used
+	// at volume load to verify that no .idx entry references bytes past
+	// the end of the .dat — the deeper-than-tail corruption shape from
+	// issue #8928 — without paying for a second linear scan of the index.
+	MaximumNeedleEnd int64 `json:"MaxNeedleEnd"`
+}
+
+type batchMapMetricSnapshot struct {
+	deletionCounter     uint32
+	fileCounter         uint32
+	deletionByteCounter uint64
+	fileByteCounter     uint64
+	maximumFileKey      uint64
+	maximumNeedleEnd    int64
+}
+
+func (mm *mapMetric) restoreBatchMetrics(snapshot batchMapMetricSnapshot) {
+	atomic.StoreUint32(&mm.DeletionCounter, snapshot.deletionCounter)
+	atomic.StoreUint32(&mm.FileCounter, snapshot.fileCounter)
+	atomic.StoreUint64(&mm.DeletionByteCounter, snapshot.deletionByteCounter)
+	atomic.StoreUint64(&mm.FileByteCounter, snapshot.fileByteCounter)
+	atomic.StoreUint64(&mm.MaximumFileKey, snapshot.maximumFileKey)
+	atomic.StoreInt64(&mm.MaximumNeedleEnd, snapshot.maximumNeedleEnd)
 }
 
 func (mm *mapMetric) logDelete(deletedByteCount Size) {
@@ -91,33 +118,70 @@ func (mm *mapMetric) MaybeSetMaxFileKey(key NeedleId) {
 	}
 }
 
-func newNeedleMapMetricFromIndexFile(r *os.File) (mm *mapMetric, err error) {
-	mm = &mapMetric{}
-	var bf *bloom.BloomFilter
+// MaybeSetMaxNeedleEnd updates MaximumNeedleEnd if the supplied entry's
+// (offset + actual size) is larger than what we have seen so far. Skips
+// deleted/zero-offset entries because they don't reserve space in .dat.
+func (mm *mapMetric) MaybeSetMaxNeedleEnd(offset Offset, size Size, version needle.Version) {
+	if mm == nil || offset.IsZero() || !size.IsValid() {
+		return
+	}
+	end := offset.ToActualOffset() + needle.GetActualSize(size, version)
+	if end > atomic.LoadInt64(&mm.MaximumNeedleEnd) {
+		atomic.StoreInt64(&mm.MaximumNeedleEnd, end)
+	}
+}
+
+func (mm *mapMetric) MaxNeedleEnd() int64 {
+	if mm == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&mm.MaximumNeedleEnd)
+}
+
+func needleMapMetricFromIndexFile(r *os.File, mm *mapMetric, version needle.Version) error {
+	var bf *boom.BloomFilter
 	buf := make([]byte, NeedleIdSize)
-	err = reverseWalkIndexFile(r, func(entryCount int64) {
-		bf = bloom.NewWithEstimates(uint(entryCount), 0.001)
+	var liveKeyCount uint32
+	var liveKeyBytes uint64
+	err := reverseWalkIndexFile(r, func(entryCount int64) {
+		bf = boom.NewBloomFilter(uint(entryCount), 0.001)
+		// The default FNV-1 kernel leaves the last byte of a big-endian
+		// NeedleId as the final XOR, so keys in the same 256-block get
+		// correlated probe positions and false positives arrive in bursts
+		// of hundreds. xxhash diffuses the input fully and keeps the
+		// observed rate near the 0.001 target.
+		bf.SetHash(xxhash.New())
 	}, func(key NeedleId, offset Offset, size Size) error {
 
 		mm.MaybeSetMaxFileKey(key)
+		mm.MaybeSetMaxNeedleEnd(offset, size, version)
 		NeedleIdToBytes(buf, key)
-		if size.IsValid() {
-			mm.FileByteCounter += uint64(size)
+		seen := bf.TestAndAdd(buf)
+		if offset.IsZero() || size.IsDeleted() {
+			return nil
 		}
-
-		if !bf.Test(buf) {
-			mm.FileCounter++
-			bf.Add(buf)
-		} else {
-			// deleted file
-			mm.DeletionCounter++
-			if size.IsValid() {
-				// previously already deleted file
-				mm.DeletionByteCounter += uint64(size)
-			}
+		mm.FileCounter++
+		mm.FileByteCounter += uint64(size)
+		if !seen {
+			liveKeyCount++
+			liveKeyBytes += uint64(size)
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Runtime counters tally each live-key removal: an overwrite deletes the
+	// superseded row and a tombstone deletes the live row. Replaying forward,
+	// that is (file rows) - (keys whose latest row is live).
+	mm.DeletionCounter = mm.FileCounter - liveKeyCount
+	mm.DeletionByteCounter = mm.FileByteCounter - liveKeyBytes
+	return nil
+}
+
+func newNeedleMapMetricFromIndexFile(r *os.File, version needle.Version) (mm *mapMetric, err error) {
+	mm = &mapMetric{}
+	err = needleMapMetricFromIndexFile(r, mm, version)
 	return
 }
 
@@ -144,8 +208,11 @@ func reverseWalkIndexFile(r *os.File, initFn func(entryCount int64), fn func(key
 	remainingCount := entryCount - nextBatchSize
 
 	for remainingCount >= 0 {
-		_, e := r.ReadAt(bytes[:NeedleMapEntrySize*nextBatchSize], NeedleMapEntrySize*remainingCount)
+		n, e := r.ReadAt(bytes[:NeedleMapEntrySize*nextBatchSize], NeedleMapEntrySize*remainingCount)
 		// glog.V(0).Infoln("file", r.Name(), "readerOffset", NeedleMapEntrySize*remainingCount, "count", count, "e", e)
+		if e == io.EOF && n == int(NeedleMapEntrySize*nextBatchSize) {
+			e = nil
+		}
 		if e != nil {
 			return e
 		}

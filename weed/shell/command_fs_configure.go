@@ -2,14 +2,17 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -30,19 +33,30 @@ func (c *commandFsConfigure) Help() string {
 	fs.configure
 
 	# trying the changes and see the possible configuration file content
-	fs.configure -locationPrfix=/my/folder -collection=abc
-	fs.configure -locationPrfix=/my/folder -collection=abc -ttl=7d
+	fs.configure -locationPrefix=/my/folder -collection=abc
+	fs.configure -locationPrefix=/my/folder -collection=abc -ttl=7d
 
 	# example: configure adding only 1 physical volume for each bucket collection
-	fs.configure -locationPrfix=/buckets/ -volumeGrowthCount=1
+	fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1
 
 	# apply the changes
-	fs.configure -locationPrfix=/my/folder -collection=abc -apply
+	fs.configure -locationPrefix=/my/folder -collection=abc -apply
+
+	# example: unlock a bucket that quota enforcement made read-only
+	fs.configure -locationPrefix=/buckets/my_bucket/ -readOnly=false -apply
+
+	# example: keep one directory writable under a worm-protected tree
+	fs.configure -locationPrefix=/buckets/my_bucket/ -worm -apply
+	fs.configure -locationPrefix=/buckets/my_bucket/scratch/ -worm=false -apply
 
 	# delete the changes
-	fs.configure -locationPrfix=/my/folder -delete -apply
+	fs.configure -locationPrefix=/my/folder -delete -apply
 
 `
+}
+
+func (c *commandFsConfigure) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -51,40 +65,63 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	locationPrefix := fsConfigureCommand.String("locationPrefix", "", "path prefix, required to update the path-specific configuration")
 	collection := fsConfigureCommand.String("collection", "", "assign writes to this collection")
 	replication := fsConfigureCommand.String("replication", "", "assign writes with this replication")
-	ttl := fsConfigureCommand.String("ttl", "", "assign writes with this ttl")
+	ttl := fsConfigureCommand.String("ttl", "", "assign writes with this ttl (e.g., 1m, 1h, 1d, 1w, 1y)")
 	diskType := fsConfigureCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
-	fsync := fsConfigureCommand.Bool("fsync", false, "fsync for the writes")
+	fsync := fsConfigureCommand.Bool("fsync", false, "fsync for the writes; unset inherits from the parent path")
+	isReadOnly := fsConfigureCommand.Bool("readOnly", false, "disable writes")
+	worm := fsConfigureCommand.Bool("worm", false, "write-once-read-many, written files are readonly; unset inherits from the parent path")
+	wormGracePeriod := fsConfigureCommand.Uint64("wormGracePeriod", 0, "grace period before worm is enforced, in seconds")
+	wormRetentionTime := fsConfigureCommand.Uint64("wormRetentionTime", 0, "retention time for a worm enforced file, in seconds")
+	maxFileNameLength := fsConfigureCommand.Uint("maxFileNameLength", 0, "file name length limits in bytes for compatibility with Unix-based systems")
+	dataCenter := fsConfigureCommand.String("dataCenter", "", "assign writes to this dataCenter")
+	rack := fsConfigureCommand.String("rack", "", "assign writes to this rack")
+	dataNode := fsConfigureCommand.String("dataNode", "", "assign writes to this dataNode")
 	volumeGrowthCount := fsConfigureCommand.Int("volumeGrowthCount", 0, "the number of physical volumes to add if no writable volumes")
 	isDelete := fsConfigureCommand.Bool("delete", false, "delete the configuration by locationPrefix")
 	apply := fsConfigureCommand.Bool("apply", false, "update and apply filer configuration")
 	if err = fsConfigureCommand.Parse(args); err != nil {
-		return nil
-	}
-
-	var buf bytes.Buffer
-	if err = commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-		return filer.ReadEntry(commandEnv.MasterClient, client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, &buf)
-	}); err != nil && err != filer_pb.ErrNotFound {
 		return err
 	}
 
-	fc := filer.NewFilerConf()
-	if buf.Len() > 0 {
-		if err = fc.LoadFromBytes(buf.Bytes()); err != nil {
-			return err
-		}
+	fc, err := filer.ReadFilerConf(commandEnv.FilerAddress(), commandEnv.option.GrpcDialOption, commandEnv.MasterClient)
+	if err != nil {
+		return err
 	}
 
 	if *locationPrefix != "" {
-		locConf := &filer_pb.FilerConf_PathConf{
-			LocationPrefix:    *locationPrefix,
-			Collection:        *collection,
-			Replication:       *replication,
-			Ttl:               *ttl,
-			Fsync:             *fsync,
-			DiskType:          *diskType,
-			VolumeGrowthCount: uint32(*volumeGrowthCount),
+		infoAboutSimulationMode(writer, *apply, "-apply")
+		// A path rule cannot express "the collection with no name": an empty
+		// Collection means "unset" and merges as inherit, so the keyword would
+		// be silently ignored.
+		if *collection == CollectionDefault {
+			return fmt.Errorf("path rules cannot select the collection with no name; omit -collection to inherit")
 		}
+		locConf := &filer_pb.FilerConf_PathConf{
+			LocationPrefix:           *locationPrefix,
+			Collection:               *collection,
+			Replication:              *replication,
+			Ttl:                      *ttl,
+			MaxFileNameLength:        uint32(*maxFileNameLength),
+			DiskType:                 *diskType,
+			VolumeGrowthCount:        uint32(*volumeGrowthCount),
+			ReadOnly:                 *isReadOnly,
+			DataCenter:               *dataCenter,
+			Rack:                     *rack,
+			DataNode:                 *dataNode,
+			WormGracePeriodSeconds:   *wormGracePeriod,
+			WormRetentionTimeSeconds: *wormRetentionTime,
+		}
+
+		// fsync and worm are only carried when the flag is passed, so a rule that
+		// says nothing about them keeps inheriting from the enclosing path
+		fsConfigureCommand.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "fsync":
+				locConf.Fsync = proto.Bool(*fsync)
+			case "worm":
+				locConf.Worm = proto.Bool(*worm)
+			}
+		})
 
 		// check collection
 		if *collection != "" && strings.HasPrefix(*locationPrefix, "/buckets/") {
@@ -98,7 +135,17 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 				return fmt.Errorf("parse replication %s: %v", *replication, err)
 			}
 			if *volumeGrowthCount%rp.GetCopyCount() != 0 {
-				return fmt.Errorf("volumeGrowthCount %d should be devided by replication copy count %d", *volumeGrowthCount, rp.GetCopyCount())
+				return fmt.Errorf("volumeGrowthCount %d should be divided by replication copy count %d", *volumeGrowthCount, rp.GetCopyCount())
+			}
+		}
+
+		// check ttl
+		if *ttl != "" {
+			regex := "^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)[mhdwMy]$"
+			match, _ := regexp.MatchString(regex, *ttl)
+
+			if !match {
+				return fmt.Errorf("ttl should be of the following format [1 to 255][unit] (e.g., 5m, 2h, 180d, 1w, 2y)")
 			}
 		}
 
@@ -107,18 +154,32 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			fc.DeleteLocationConf(*locationPrefix)
 		} else {
 			fc.AddLocationConf(locConf)
+			// AddLocationConf merges this boolean field with OR, which can never
+			// turn it off; let an explicitly passed false win, e.g. -readOnly=false
+			// to reopen a bucket that quota enforcement locked. fsync and worm do
+			// not belong here: they merge on presence, so the values set above
+			// already win.
+			if mergedConf, found := fc.GetLocationConf(*locationPrefix); found {
+				fsConfigureCommand.Visit(func(f *flag.Flag) {
+					if f.Name == "readOnly" {
+						mergedConf.ReadOnly = *isReadOnly
+					}
+				})
+			}
 		}
 	}
 
-	buf.Reset()
-	fc.ToText(&buf)
+	var buf2 bytes.Buffer
+	fc.ToText(&buf2)
 
-	fmt.Fprintf(writer, string(buf.Bytes()))
+	fmt.Fprint(writer, buf2.String())
 	fmt.Fprintln(writer)
 
 	if *apply {
 
-		if err := filer.SaveAs(commandEnv.option.FilerHost, int(commandEnv.option.FilerPort), filer.DirectoryEtcSeaweedFS, filer.FilerConfName, "text/plain; charset=utf-8", &buf); err != nil {
+		if err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf2.Bytes())
+		}); err != nil && err != filer_pb.ErrNotFound {
 			return err
 		}
 
@@ -126,4 +187,36 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 
 	return nil
 
+}
+
+func infoAboutSimulationMode(writer io.Writer, forceMode bool, forceModeOption string) {
+	if forceMode {
+		return
+	}
+	fmt.Fprintf(writer, "Running in simulation mode. Use \"%s\" option to apply the changes.\n", forceModeOption)
+}
+
+// handleDeprecatedForceFlag handles the deprecated -force flag by checking if it was
+// explicitly provided, printing a deprecation warning, and copying its
+// value to the new flag. This ensures that explicit -force=false takes precedence.
+func handleDeprecatedForceFlag(writer io.Writer, fs *flag.FlagSet, forceAlias *bool, applyFlag *bool) {
+	forceIsSet := false
+	applyIsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "force":
+			forceIsSet = true
+		case "apply":
+			applyIsSet = true
+		}
+	})
+
+	if forceIsSet {
+		if applyIsSet {
+			fmt.Fprintf(writer, "WARNING: both -force and -apply are set. -force is deprecated and takes precedence. Please use only -apply.\n")
+		} else {
+			fmt.Fprintf(writer, "WARNING: -force is deprecated, please use -apply instead.\n")
+		}
+		*applyFlag = *forceAlias
+	}
 }

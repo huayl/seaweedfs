@@ -6,15 +6,16 @@ import (
 	"os"
 
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/storage"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
-//This map uses in memory level db
+// This map uses in memory level db
 type MemDb struct {
 	db *leveldb.DB
 }
@@ -37,7 +38,7 @@ func (cm *MemDb) Set(key NeedleId, offset Offset, size Size) error {
 	bytes := ToBytes(key, offset, size)
 
 	if err := cm.db.Put(bytes[0:NeedleIdSize], bytes[NeedleIdSize:NeedleIdSize+OffsetSize+SizeSize], nil); err != nil {
-		return fmt.Errorf("failed to write temp leveldb: %v", err)
+		return fmt.Errorf("failed to write temp leveldb: %w", err)
 	}
 	return nil
 }
@@ -61,17 +62,47 @@ func (cm *MemDb) Get(key NeedleId) (*NeedleValue, bool) {
 }
 
 // Visit visits all entries or stop if any error when visiting
+func doVisit(iter iterator.Iterator, visit func(NeedleValue) error) (ret error) {
+	key := BytesToNeedleId(iter.Key())
+	data := iter.Value()
+	offset := BytesToOffset(data[0:OffsetSize])
+	size := BytesToSize(data[OffsetSize : OffsetSize+SizeSize])
+
+	needle := NeedleValue{Key: key, Offset: offset, Size: size}
+	ret = visit(needle)
+	if ret != nil {
+		return
+	}
+	return nil
+}
+
 func (cm *MemDb) AscendingVisit(visit func(NeedleValue) error) (ret error) {
 	iter := cm.db.NewIterator(nil, nil)
+	if iter.First() {
+		if ret = doVisit(iter, visit); ret != nil {
+			return
+		}
+	}
 	for iter.Next() {
-		key := BytesToNeedleId(iter.Key())
-		data := iter.Value()
-		offset := BytesToOffset(data[0:OffsetSize])
-		size := BytesToSize(data[OffsetSize : OffsetSize+SizeSize])
+		if ret = doVisit(iter, visit); ret != nil {
+			return
+		}
+	}
+	iter.Release()
+	ret = iter.Error()
 
-		needle := NeedleValue{Key: key, Offset: offset, Size: size}
-		ret = visit(needle)
-		if ret != nil {
+	return
+}
+
+func (cm *MemDb) DescendingVisit(visit func(NeedleValue) error) (ret error) {
+	iter := cm.db.NewIterator(nil, nil)
+	if iter.Last() {
+		if ret = doVisit(iter, visit); ret != nil {
+			return
+		}
+	}
+	for iter.Prev() {
+		if ret = doVisit(iter, visit); ret != nil {
 			return
 		}
 	}
@@ -86,7 +117,16 @@ func (cm *MemDb) SaveToIdx(idxName string) (ret error) {
 	if err != nil {
 		return
 	}
-	defer idxFile.Close()
+	defer func() {
+		// The .cpx generated here is renamed to .idx at commit, so a discarded
+		// fsync or close error could leave a partially-written index after a crash.
+		if syncErr := idxFile.Sync(); syncErr != nil && ret == nil {
+			ret = syncErr
+		}
+		if closeErr := idxFile.Close(); closeErr != nil && ret == nil {
+			ret = closeErr
+		}
+	}()
 
 	return cm.AscendingVisit(func(value NeedleValue) error {
 		if value.Offset.IsZero() || value.Size.IsDeleted() {
@@ -111,8 +151,12 @@ func (cm *MemDb) LoadFromIdx(idxName string) (ret error) {
 
 func (cm *MemDb) LoadFromReaderAt(readerAt io.ReaderAt) (ret error) {
 
-	return idx.WalkIndexFile(readerAt, func(key NeedleId, offset Offset, size Size) error {
-		if offset.IsZero() || size.IsDeleted() {
+	return cm.LoadFilterFromReaderAt(readerAt, true, true)
+}
+
+func (cm *MemDb) LoadFilterFromReaderAt(readerAt io.ReaderAt, isFilterOffsetZero bool, isFilterDeleted bool) (ret error) {
+	return idx.WalkIndexFile(readerAt, 0, func(key NeedleId, offset Offset, size Size) error {
+		if (isFilterOffsetZero && offset.IsZero()) || (isFilterDeleted && size.IsDeleted()) {
 			return cm.Delete(key)
 		}
 		return cm.Set(key, offset, size)

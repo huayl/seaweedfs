@@ -1,12 +1,27 @@
 package grace
 
 import (
+	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
+
+// StartDebugServer starts an HTTP server for pprof debugging on the specified port.
+// The server runs in a goroutine and serves pprof endpoints at /debug/pprof/*.
+func StartDebugServer(debugPort int) {
+	go func() {
+		addr := fmt.Sprintf("127.0.0.1:%d", debugPort)
+		glog.V(0).Infof("Starting debug server for pprof at http://%s/debug/pprof/", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+			glog.Errorf("Failed to start debug server on %s: %v", addr, err)
+		}
+	}()
+}
 
 func SetupProfiling(cpuProfile, memProfile string) {
 	if cpuProfile != "" {
@@ -14,9 +29,31 @@ func SetupProfiling(cpuProfile, memProfile string) {
 		if err != nil {
 			glog.Fatal(err)
 		}
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
 		pprof.StartCPUProfile(f)
 		OnInterrupt(func() {
 			pprof.StopCPUProfile()
+			f.Close()
+
+			// write block pprof
+			blockF, err := os.Create(cpuProfile + ".block")
+			if err != nil {
+				return
+			}
+			p := pprof.Lookup("block")
+			p.WriteTo(blockF, 0)
+			blockF.Close()
+
+			// write mutex pprof
+			mutexF, err := os.Create(cpuProfile + ".mutex")
+			if err != nil {
+				return
+			}
+			p = pprof.Lookup("mutex")
+			p.WriteTo(mutexF, 0)
+			mutexF.Close()
+
 		})
 	}
 	if memProfile != "" {

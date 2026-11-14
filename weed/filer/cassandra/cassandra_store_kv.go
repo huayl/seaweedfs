@@ -3,9 +3,11 @@ package cassandra
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/gocql/gocql"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 )
 
 func (store *CassandraStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
@@ -25,10 +27,11 @@ func (store *CassandraStore) KvGet(ctx context.Context, key []byte) (data []byte
 
 	if err := store.session.Query(
 		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Consistency(gocql.One).Scan(&data); err != nil {
-		if err != gocql.ErrNotFound {
+		dir, name).Scan(&data); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer.ErrKvNotFound
 		}
+		return nil, fmt.Errorf("kv get: %w", err)
 	}
 
 	if len(data) == 0 {
@@ -44,7 +47,7 @@ func (store *CassandraStore) KvDelete(ctx context.Context, key []byte) (err erro
 	if err := store.session.Query(
 		"DELETE FROM filemeta WHERE directory=? AND name=?",
 		dir, name).Exec(); err != nil {
-		return fmt.Errorf("kv delete: %v", err)
+		return fmt.Errorf("kv delete: %w", err)
 	}
 
 	return nil

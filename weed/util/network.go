@@ -2,8 +2,10 @@ package util
 
 import (
 	"net"
+	"strconv"
+	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 func DetectedHostAddress() string {
@@ -13,6 +15,18 @@ func DetectedHostAddress() string {
 		return ""
 	}
 
+	if v4Address := selectIpV4(netInterfaces, true); v4Address != "" {
+		return v4Address
+	}
+
+	if v6Address := selectIpV4(netInterfaces, false); v6Address != "" {
+		return v6Address
+	}
+
+	return "localhost"
+}
+
+func selectIpV4(netInterfaces []net.Interface, isIpV4 bool) string {
 	for _, netInterface := range netInterfaces {
 		if (netInterface.Flags & net.FlagUp) == 0 {
 			continue
@@ -24,12 +38,43 @@ func DetectedHostAddress() string {
 
 		for _, a := range addrs {
 			if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-				if ipNet.IP.To4() != nil {
-					return ipNet.IP.String()
+				if isIpV4 {
+					if ipNet.IP.To4() != nil {
+						return ipNet.IP.String()
+					}
+				} else {
+					if ipNet.IP.To4() == nil && ipNet.IP.To16() != nil {
+						// Filter out link-local IPv6 addresses (fe80::/10)
+						// They require zone identifiers and are not suitable for server binding
+						if !ipNet.IP.IsLinkLocalUnicast() {
+							return ipNet.IP.String()
+						}
+					}
 				}
 			}
 		}
 	}
+	return ""
+}
 
-	return "localhost"
+func JoinHostPort(host string, port int) string {
+	return JoinHostPortStr(host, strconv.Itoa(port))
+}
+
+func JoinHostPortStr(host string, port string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host + ":" + port
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// GetVolumeServerId returns the volume server ID.
+// If id is provided (non-empty after trimming), use it as the identifier.
+// Otherwise, fall back to ip:port for backward compatibility.
+func GetVolumeServerId(id, ip string, port int) string {
+	volumeServerId := strings.TrimSpace(id)
+	if volumeServerId == "" {
+		volumeServerId = JoinHostPort(ip, port)
+	}
+	return volumeServerId
 }

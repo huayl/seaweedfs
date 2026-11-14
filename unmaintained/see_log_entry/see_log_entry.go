@@ -7,19 +7,21 @@ import (
 	"log"
 	"os"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
-	logdataFile = flag.String("logdata", "", "log data file saved under "+ filer.SystemLogDir)
+	logdataFile = flag.String("logdata", "", "log data file saved under "+filer.SystemLogDir)
 )
 
 func main() {
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
 	dst, err := os.OpenFile(*logdataFile, os.O_RDONLY, 0644)
 	if err != nil {

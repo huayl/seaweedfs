@@ -9,16 +9,17 @@ import (
 	"io"
 	"math"
 	"os"
-	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
 )
 
@@ -30,28 +31,29 @@ var (
 )
 
 /*
-	Diff the volume's files across multiple volume servers.
-	diff_volume_servers -volumeServers 127.0.0.1:8080,127.0.0.1:8081 -volumeId 5
+Diff the volume's files across multiple volume servers.
+diff_volume_servers -volumeServers 127.0.0.1:8080,127.0.0.1:8081 -volumeId 5
 
-	Example Output:
-	reference 127.0.0.1:8081
-	fileId volumeServer message
-	5,01617c3f61 127.0.0.1:8080 wrongSize
+Example Output:
+reference 127.0.0.1:8081
+fileId volumeServer message
+5,01617c3f61 127.0.0.1:8080 wrongSize
 */
 func main() {
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	vid := uint32(*volumeId)
-	servers := strings.Split(*serversStr, ",")
+	servers := pb.ServerAddresses(*serversStr).ToAddresses()
 	if len(servers) < 2 {
 		glog.Fatalf("You must specify more than 1 server\n")
 	}
-	var referenceServer string
+	var referenceServer pb.ServerAddress
 	var maxOffset int64
-	allFiles := map[string]map[types.NeedleId]needleState{}
+	allFiles := map[pb.ServerAddress]map[types.NeedleId]needleState{}
 	for _, addr := range servers {
 		files, offset, err := getVolumeFiles(vid, addr)
 		if err != nil {
@@ -121,9 +123,9 @@ type needleState struct {
 	size  types.Size
 }
 
-func getVolumeFiles(v uint32, addr string) (map[types.NeedleId]needleState, int64, error) {
+func getVolumeFiles(v uint32, addr pb.ServerAddress) (map[types.NeedleId]needleState, int64, error) {
 	var idxFile *bytes.Reader
-	err := operation.WithVolumeServerClient(addr, grpcDialOption, func(vs volume_server_pb.VolumeServerClient) error {
+	err := operation.WithVolumeServerClient(false, addr, grpcDialOption, func(vs volume_server_pb.VolumeServerClient) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		copyFileClient, err := vs.CopyFile(ctx, &volume_server_pb.CopyFileRequest{
@@ -156,7 +158,7 @@ func getVolumeFiles(v uint32, addr string) (map[types.NeedleId]needleState, int6
 
 	var maxOffset int64
 	files := map[types.NeedleId]needleState{}
-	err = idx.WalkIndexFile(idxFile, func(key types.NeedleId, offset types.Offset, size types.Size) error {
+	err = idx.WalkIndexFile(idxFile, 0, func(key types.NeedleId, offset types.Offset, size types.Size) error {
 		if offset.IsZero() || size.IsDeleted() {
 			files[key] = needleState{
 				state: stateDeleted,
@@ -179,9 +181,9 @@ func getVolumeFiles(v uint32, addr string) (map[types.NeedleId]needleState, int6
 	return files, maxOffset, nil
 }
 
-func getNeedleFileId(v uint32, nid types.NeedleId, addr string) (string, error) {
+func getNeedleFileId(v uint32, nid types.NeedleId, addr pb.ServerAddress) (string, error) {
 	var id string
-	err := operation.WithVolumeServerClient(addr, grpcDialOption, func(vs volume_server_pb.VolumeServerClient) error {
+	err := operation.WithVolumeServerClient(false, addr, grpcDialOption, func(vs volume_server_pb.VolumeServerClient) error {
 		resp, err := vs.VolumeNeedleStatus(context.Background(), &volume_server_pb.VolumeNeedleStatusRequest{
 			VolumeId: v,
 			NeedleId: uint64(nid),

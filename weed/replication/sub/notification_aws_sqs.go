@@ -8,10 +8,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -41,7 +41,8 @@ func (k *AwsSqsInput) Initialize(configuration util.Configuration, prefix string
 func (k *AwsSqsInput) initialize(awsAccessKeyId, awsSecretAccessKey, region, queueName string) (err error) {
 
 	config := &aws.Config{
-		Region: aws.String(region),
+		Region:                        aws.String(region),
+		S3DisableContentMD5Validation: aws.Bool(true),
 	}
 	if awsAccessKeyId != "" && awsSecretAccessKey != "" {
 		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, awsSecretAccessKey, "")
@@ -49,7 +50,7 @@ func (k *AwsSqsInput) initialize(awsAccessKeyId, awsSecretAccessKey, region, que
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return fmt.Errorf("create aws session: %v", err)
+		return fmt.Errorf("create aws session: %w", err)
 	}
 	k.svc = sqs.New(sess)
 
@@ -97,16 +98,26 @@ func (k *AwsSqsInput) ReceiveMessage() (key string, message *filer_pb.EventNotif
 	key = *keyValue.StringValue
 	text := *result.Messages[0].Body
 	message = &filer_pb.EventNotification{}
-	err = proto.UnmarshalText(text, message)
-
-	// delete the message
-	_, err = k.svc.DeleteMessage(&sqs.DeleteMessageInput{
-		QueueUrl:      &k.queueUrl,
-		ReceiptHandle: result.Messages[0].ReceiptHandle,
-	})
-
+	err = proto.Unmarshal([]byte(text), message)
 	if err != nil {
-		glog.V(1).Infof("delete message from sqs %s: %v", k.queueUrl, err)
+		err = fmt.Errorf("unmarshal message from sqs %s: %w", k.queueUrl, err)
+		return
+	}
+
+	// Delete only once the message has been replicated. Deleting on receipt
+	// drops the message for good when the sink write fails; leaving it in the
+	// queue lets the visibility timeout redeliver it.
+	receiptHandle := result.Messages[0].ReceiptHandle
+	onSuccessFn = func() {
+		if _, deleteErr := k.svc.DeleteMessage(&sqs.DeleteMessageInput{
+			QueueUrl:      &k.queueUrl,
+			ReceiptHandle: receiptHandle,
+		}); deleteErr != nil {
+			glog.V(1).Infof("delete message from sqs %s: %v", k.queueUrl, deleteErr)
+		}
+	}
+	onFailureFn = func() {
+		glog.V(1).Infof("keeping message %s in sqs %s for redelivery", key, k.queueUrl)
 	}
 
 	return

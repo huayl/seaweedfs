@@ -10,11 +10,14 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 func downloadFromS3(sess s3iface.S3API, destFileName string, sourceBucket string, sourceKey string,
-	fn func(progressed int64, percentage float32) error) (fileSize int64, err error) {
+	fn func(progressed int64, percentage float32) error, concurrency int) (fileSize int64, err error) {
+	if concurrency <= 0 {
+		concurrency = defaultDownloadConcurrency
+	}
 
 	fileSize, err = getFileSize(sess, sourceBucket, sourceKey)
 	if err != nil {
@@ -31,7 +34,7 @@ func downloadFromS3(sess s3iface.S3API, destFileName string, sourceBucket string
 	// Create a downloader with the session and custom options
 	downloader := s3manager.NewDownloaderWithClient(sess, func(u *s3manager.Downloader) {
 		u.PartSize = int64(64 * 1024 * 1024)
-		u.Concurrency = 5
+		u.Concurrency = concurrency
 	})
 
 	fileWriter := &s3DownloadProgressedWriter{
@@ -47,7 +50,13 @@ func downloadFromS3(sess s3iface.S3API, destFileName string, sourceBucket string
 		Key:    aws.String(sourceKey),
 	})
 	if err != nil {
-		return fileSize, fmt.Errorf("failed to download file %s: %v", destFileName, err)
+		return fileSize, fmt.Errorf("failed to download /buckets/%s/%s to %s: %v", sourceBucket, sourceKey, destFileName, err)
+	}
+
+	// fsync the downloaded .dat so its content is durable before the caller trims the
+	// remote reference and deletes the shared remote object.
+	if syncErr := f.Sync(); syncErr != nil {
+		return fileSize, fmt.Errorf("failed to fsync %s: %v", destFileName, syncErr)
 	}
 
 	glog.V(1).Infof("downloaded file %s\n", destFileName)
@@ -58,10 +67,10 @@ func downloadFromS3(sess s3iface.S3API, destFileName string, sourceBucket string
 // adapted from https://github.com/aws/aws-sdk-go/pull/1868
 // and https://petersouter.xyz/s3-download-progress-bar-in-golang/
 type s3DownloadProgressedWriter struct {
-	fp      *os.File
 	size    int64
 	written int64
 	fn      func(progressed int64, percentage float32) error
+	fp      *os.File
 }
 
 func (w *s3DownloadProgressedWriter) WriteAt(p []byte, off int64) (int, error) {

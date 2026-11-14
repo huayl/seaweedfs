@@ -1,12 +1,13 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -29,7 +30,15 @@ func (c *commandFsDu) Help() string {
 `
 }
 
+func (c *commandFsDu) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
 
 	path, err := commandEnv.parseUrl(findInputDirectory(args))
 	if err != nil {
@@ -45,7 +54,7 @@ func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 	blockCount, byteCount, err = duTraverseDirectory(writer, commandEnv, dir, name)
 
 	if name == "" && err == nil {
-		fmt.Fprintf(writer, "block:%4d\tbyte:%10d\t%s\n", blockCount, byteCount, dir)
+		fmt.Fprintf(writer, "block:%4d\tlogical size:%10d\t%s\n", blockCount, byteCount, dir)
 	}
 
 	return
@@ -54,7 +63,7 @@ func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 
 func duTraverseDirectory(writer io.Writer, filerClient filer_pb.FilerClient, dir, name string) (blockCount, byteCount uint64, err error) {
 
-	err = filer_pb.ReadDirAllEntries(filerClient, util.FullPath(dir), name, func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.ReadDirAllEntries(context.Background(), filerClient, util.FullPath(dir), name, func(entry *filer_pb.Entry, isLast bool) error {
 
 		var fileBlockCount, fileByteCount uint64
 
@@ -69,14 +78,14 @@ func duTraverseDirectory(writer io.Writer, filerClient filer_pb.FilerClient, dir
 				byteCount += numByte
 			}
 		} else {
-			fileBlockCount = uint64(len(entry.Chunks))
+			fileBlockCount = uint64(len(entry.GetChunks()))
 			fileByteCount = filer.FileSize(entry)
 			blockCount += fileBlockCount
 			byteCount += fileByteCount
 		}
 
 		if name != "" && !entry.IsDirectory {
-			fmt.Fprintf(writer, "block:%4d\tbyte:%10d\t%s/%s\n", fileBlockCount, fileByteCount, dir, entry.Name)
+			fmt.Fprintf(writer, "block:%4d\tlogical size:%10d\t%s/%s\n", fileBlockCount, fileByteCount, dir, entry.Name)
 		}
 		return nil
 	})

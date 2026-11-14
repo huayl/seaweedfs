@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/chrislusf/seaweedfs/weed/sequence"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+
+	"github.com/seaweedfs/seaweedfs/weed/sequence"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
 var topologyLayout = `
@@ -88,27 +90,42 @@ func setup(topologyLayout string) *Topology {
 		dcMap := dcValue.(map[string]interface{})
 		topo.LinkChildNode(dc)
 		for rackKey, rackValue := range dcMap {
-			rack := NewRack(rackKey)
+			dcRack := NewRack(rackKey)
 			rackMap := rackValue.(map[string]interface{})
-			dc.LinkChildNode(rack)
+			dc.LinkChildNode(dcRack)
 			for serverKey, serverValue := range rackMap {
 				server := NewDataNode(serverKey)
 				serverMap := serverValue.(map[string]interface{})
-				rack.LinkChildNode(server)
+				if ip, ok := serverMap["ip"]; ok {
+					server.Ip = ip.(string)
+				}
+				dcRack.LinkChildNode(server)
 				for _, v := range serverMap["volumes"].([]interface{}) {
 					m := v.(map[string]interface{})
 					vi := storage.VolumeInfo{
 						Id:      needle.VolumeId(int64(m["id"].(float64))),
 						Size:    uint64(m["size"].(float64)),
-						Version: needle.CurrentVersion}
+						Version: needle.GetCurrentVersion(),
+					}
+					if mVal, ok := m["collection"]; ok {
+						vi.Collection = mVal.(string)
+					}
+					if mVal, ok := m["replication"]; ok {
+						rp, _ := super_block.NewReplicaPlacementFromString(mVal.(string))
+						vi.ReplicaPlacement = rp
+					}
+					if vi.ReplicaPlacement != nil {
+						vl := topo.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, needle.EMPTY_TTL, types.HardDriveType)
+						vl.RegisterVolume(&vi, server, nil)
+						vl.setVolumeWritable(vi.Id)
+					}
 					server.AddOrUpdateVolume(vi)
 				}
 
 				disk := server.getOrCreateDisk("")
-				deltaDiskUsages := newDiskUsages()
-				deltaDiskUsage := deltaDiskUsages.getOrCreateDisk("")
-				deltaDiskUsage.maxVolumeCount = int64(serverMap["limit"].(float64))
-				disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+				disk.UpAdjustDiskUsageDelta("", &DiskUsageCounts{
+					maxVolumeCount: int64(serverMap["limit"].(float64)),
+				})
 
 			}
 		}
@@ -128,13 +145,46 @@ func TestFindEmptySlotsForOneVolume(t *testing.T) {
 		Rack:             "",
 		DataNode:         "",
 	}
-	servers, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption)
+	servers, _, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption, false)
 	if err != nil {
 		fmt.Println("finding empty slots error :", err)
 		t.Fail()
 	}
 	for _, server := range servers {
 		fmt.Println("assigned node :", server.Id())
+	}
+}
+
+func TestGrowthBlocker(t *testing.T) {
+	topo := setup(topologyLayout)
+
+	rp010, _ := super_block.NewReplicaPlacementFromString("010")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc1"}); err != nil {
+		t.Fatalf("dc1 has the two racks 010 needs, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc3"}); err == nil {
+		t.Fatal("dc3 has a single rack, 010 should report a blocker")
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp010, DataCenter: "dc2"}); err == nil {
+		t.Fatal("dc2 has no racks, 010 should report a blocker")
+	}
+
+	rp000, _ := super_block.NewReplicaPlacementFromString("000")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp000, DataCenter: "dc3"}); err != nil {
+		t.Fatalf("dc3 has a node for 000, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp000, DataCenter: "dc9"}); err == nil {
+		t.Fatal("dc9 does not exist, 000 should report a blocker")
+	}
+
+	// The named location binds only the first replica: dc1 hosts it for 100
+	// and dc3 has room for the second, so the placement is reachable.
+	rp100, _ := super_block.NewReplicaPlacementFromString("100")
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp100, DataCenter: "dc1"}); err != nil {
+		t.Fatalf("dc3 has room for the second 100 replica, got blocker: %v", err)
+	}
+	if err := topo.GrowthBlocker(&VolumeGrowOption{ReplicaPlacement: rp100, DataCenter: "dc2"}); err == nil {
+		t.Fatal("dc2 has no room for the first 100 replica")
 	}
 }
 
@@ -250,7 +300,7 @@ func TestReplication011(t *testing.T) {
 		Rack:             "",
 		DataNode:         "",
 	}
-	servers, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption)
+	servers, _, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption, false)
 	if err != nil {
 		fmt.Println("finding empty slots error :", err)
 		t.Fail()
@@ -328,7 +378,7 @@ func TestFindEmptySlotsForOneVolumeScheduleByWeight(t *testing.T) {
 	distribution := map[NodeId]int{}
 	// assign 1000 volumes
 	for i := 0; i < 1000; i++ {
-		servers, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption)
+		servers, _, err := vg.findEmptySlotsForOneVolume(topo, volumeGrowOption, false)
 		if err != nil {
 			fmt.Println("finding empty slots error :", err)
 			t.Fail()
@@ -344,5 +394,154 @@ func TestFindEmptySlotsForOneVolumeScheduleByWeight(t *testing.T) {
 
 	for k, v := range distribution {
 		fmt.Printf("%s : %d\n", k, v)
+	}
+}
+
+var topologyLayout4 = `
+{
+  "dc1":{
+    "rack1":{
+      "serverdc111":{
+		"ip": "127.0.0.1",
+        "volumes":[
+          {"id":1, "size":12312, "collection":"test", "replication":"001"},
+          {"id":2, "size":12312, "collection":"test", "replication":"100"},
+          {"id":4, "size":12312, "collection":"test", "replication":"100"},
+          {"id":6, "size":12312, "collection":"test", "replication":"010"}
+        ],
+        "limit":100
+      }
+    }
+  },
+  "dc2":{
+    "rack1":{
+      "serverdc211":{
+		"ip": "127.0.0.2",
+        "volumes":[
+          {"id":2, "size":12312, "collection":"test", "replication":"100"},
+          {"id":3, "size":12312, "collection":"test", "replication":"010"},
+          {"id":5, "size":12312, "collection":"test", "replication":"001"},
+          {"id":6, "size":12312, "collection":"test", "replication":"010"}
+		],
+        "limit":100
+      }
+    }
+  },
+  "dc3":{
+    "rack1":{
+      "serverdc311":{
+		"ip": "127.0.0.3",
+        "volumes":[
+          {"id":1, "size":12312, "collection":"test", "replication":"001"},
+          {"id":3, "size":12312, "collection":"test", "replication":"010"},
+          {"id":4, "size":12312, "collection":"test", "replication":"100"},
+          {"id":5, "size":12312, "collection":"test", "replication":"001"}
+		],
+        "limit":100
+      }
+    }
+  }
+}
+`
+
+func TestPickForWrite(t *testing.T) {
+	topo := setup(topologyLayout4)
+	volumeGrowOption := &VolumeGrowOption{
+		Collection: "test",
+		DataCenter: "",
+		Rack:       "",
+		DataNode:   "",
+	}
+	VolumeGrowStrategy.Threshold = 0.9
+	for _, rpStr := range []string{"001", "010", "100"} {
+		rp, _ := super_block.NewReplicaPlacementFromString(rpStr)
+		vl := topo.GetVolumeLayout("test", rp, needle.EMPTY_TTL, types.HardDriveType)
+		volumeGrowOption.ReplicaPlacement = rp
+		for _, dc := range []string{"", "dc1", "dc2", "dc3", "dc0"} {
+			volumeGrowOption.DataCenter = dc
+			for _, r := range []string{""} {
+				volumeGrowOption.Rack = r
+				for _, dn := range []string{""} {
+					if dc == "" && dn != "" {
+						continue
+					}
+					volumeGrowOption.DataNode = dn
+					// Small expectedDataSize hint: this test iterates many times
+					// and the layout uses a 32KB volume size limit. With hint=0
+					// (default 1MB pendingDelta), RecordAssign would exceed the
+					// limit on the first call and eagerly remove the volume
+					// from writable. Keep the hint tiny so effectiveSize stays
+					// below the limit across all iterations.
+					fileId, count, _, shouldGrow, err := topo.PickForWrite(1, volumeGrowOption, vl, 1024)
+					if dc == "dc0" {
+						if err == nil || count != 0 || !shouldGrow {
+							fmt.Println(dc, r, dn, "pick for write should be with error")
+							t.Fail()
+						}
+					} else if err != nil {
+						fmt.Println(dc, r, dn, "pick for write error :", err)
+						t.Fail()
+					} else if count == 0 {
+						fmt.Println(dc, r, dn, "pick for write count is zero")
+						t.Fail()
+					} else if len(fileId) == 0 {
+						fmt.Println(dc, r, dn, "pick for write file id is empty")
+						t.Fail()
+					} else if shouldGrow {
+						fmt.Println(dc, r, dn, "pick for write error : not should grow")
+						t.Fail()
+					}
+
+					// Also verify with a non-zero expectedDataSize hint
+					if dc != "dc0" {
+						fileId2, count2, _, shouldGrow2, err2 := topo.PickForWrite(1, volumeGrowOption, vl, 1024)
+						if err2 != nil {
+							fmt.Println(dc, r, dn, "pick for write with size hint error:", err2)
+							t.Fail()
+						} else if count2 == 0 || len(fileId2) == 0 || shouldGrow2 {
+							fmt.Println(dc, r, dn, "pick for write with size hint unexpected result")
+							t.Fail()
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestPickNodesByWeightPrefersDistinctHosts: a rack runs two physical machines
+// with two volume servers each. Picking two nodes (e.g. for a same-rack replica
+// pair) must land them on distinct hosts so a single machine failure cannot take
+// out both replicas, even though the four data nodes are independent.
+func TestPickNodesByWeightPrefersDistinctHosts(t *testing.T) {
+	rack := NewRack("rack1")
+	mk := func(id, ip string, maxVol int64) *DataNode {
+		dn := NewDataNode(id)
+		dn.Ip = ip
+		rack.LinkChildNode(dn)
+		disk := dn.getOrCreateDisk("")
+		disk.UpAdjustDiskUsageDelta("", &DiskUsageCounts{maxVolumeCount: maxVol})
+		return dn
+	}
+	mk("s1a", "10.0.0.1", 10)
+	mk("s1b", "10.0.0.1", 10)
+	mk("s2a", "10.0.0.2", 10)
+	mk("s2b", "10.0.0.2", 10)
+
+	option := &VolumeGrowOption{DiskType: types.HardDriveType}
+
+	// Selection is weighted-random, so exercise it repeatedly: with two machines
+	// available the chosen pair must always span both.
+	for i := 0; i < 50; i++ {
+		first, rest, err := rack.PickNodesByWeight(2, option, func(node Node) error { return nil })
+		if err != nil {
+			t.Fatalf("PickNodesByWeight: %v", err)
+		}
+		if len(rest) != 1 {
+			t.Fatalf("got %d rest nodes, want 1", len(rest))
+		}
+		if nodeHost(first) == nodeHost(rest[0]) {
+			t.Errorf("both picks on host %s; expected distinct machines", nodeHost(first))
+		}
 	}
 }

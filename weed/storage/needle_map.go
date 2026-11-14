@@ -5,9 +5,10 @@ import (
 	"os"
 	"sync"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle_map"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 type NeedleMapKind int
@@ -30,9 +31,14 @@ type NeedleMapper interface {
 	FileCount() int
 	DeletedCount() int
 	MaxFileKey() NeedleId
+	MaxNeedleEnd() int64
 	IndexFileSize() uint64
 	Sync() error
 	ReadIndexEntry(n int64) (key NeedleId, offset Offset, size Size, err error)
+}
+
+type batchIndexRollbacker interface {
+	truncateIndex(offset int64) error
 }
 
 type baseNeedleMapper struct {
@@ -41,6 +47,16 @@ type baseNeedleMapper struct {
 	indexFile           *os.File
 	indexFileAccessLock sync.Mutex
 	indexFileOffset     int64
+}
+
+type TempNeedleMapper interface {
+	NeedleMapper
+	DoOffsetLoading(v *Volume, indexFile *os.File, startFrom uint64) error
+	UpdateNeedleMap(v *Volume, indexFile *os.File, opts *opt.Options, ldbTimeout int64) error
+}
+
+func (nm *baseNeedleMapper) IndexFile() *os.File {
+	return nm.indexFile
 }
 
 func (nm *baseNeedleMapper) IndexFileSize() uint64 {
@@ -65,6 +81,17 @@ func (nm *baseNeedleMapper) appendToIndexFile(key NeedleId, offset Offset, size 
 
 func (nm *baseNeedleMapper) Sync() error {
 	return nm.indexFile.Sync()
+}
+
+func (nm *baseNeedleMapper) truncateIndex(offset int64) error {
+	nm.indexFileAccessLock.Lock()
+	defer nm.indexFileAccessLock.Unlock()
+
+	if err := nm.indexFile.Truncate(offset); err != nil {
+		return err
+	}
+	nm.indexFileOffset = offset
+	return nil
 }
 
 func (nm *baseNeedleMapper) ReadIndexEntry(n int64) (key NeedleId, offset Offset, size Size, err error) {

@@ -1,15 +1,19 @@
-// +build !linux,!windows
+//go:build !linux && !windows
 
 package backend
 
 import (
 	"os"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
+// PreallocateSupported reports whether CreateVolumeFile reserves the
+// requested size on this platform.
+const PreallocateSupported = false
+
 func CreateVolumeFile(fileName string, preallocate int64, memoryMapSizeMB uint32) (BackendStorageFile, error) {
-	file, e := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	file, e := OpenVolumeFile(fileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
 	if e != nil {
 		return nil, e
 	}

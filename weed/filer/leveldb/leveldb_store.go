@@ -4,20 +4,27 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/syndtr/goleveldb/leveldb"
-	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
+	"io"
 	"os"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/filter"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/leveldb_handle"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
 	DIR_FILE_SEPARATOR = byte(0x00)
+)
+
+var (
+	_ = filer.Debuggable(&LevelDBStore{})
 )
 
 func init() {
@@ -25,7 +32,7 @@ func init() {
 }
 
 type LevelDBStore struct {
-	db *leveldb.DB
+	db *leveldb_handle.DB
 }
 
 func (store *LevelDBStore) GetName() string {
@@ -38,26 +45,20 @@ func (store *LevelDBStore) Initialize(configuration weed_util.Configuration, pre
 }
 
 func (store *LevelDBStore) initialize(dir string) (err error) {
-	glog.Infof("filer store dir: %s", dir)
+	glog.V(0).Infof("filer store dir: %s", dir)
 	os.MkdirAll(dir, 0755)
 	if err := weed_util.TestFolderWritable(dir); err != nil {
 		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
 	}
 
 	opts := &opt.Options{
-		BlockCacheCapacity:            32 * 1024 * 1024, // default value is 8MiB
-		WriteBuffer:                   16 * 1024 * 1024, // default value is 4MiB
-		CompactionTableSizeMultiplier: 10,
+		BlockCacheCapacity: 32 * 1024 * 1024,         // default value is 8MiB
+		WriteBuffer:        16 * 1024 * 1024,         // default value is 4MiB
+		Filter:             filter.NewBloomFilter(8), // false positive rate 0.02
 	}
 
-	if store.db, err = leveldb.OpenFile(dir, opts); err != nil {
-		if leveldb_errors.IsCorrupted(err) {
-			store.db, err = leveldb.RecoverFile(dir, opts)
-		}
-		if err != nil {
-			glog.Infof("filer store open dir %s: %v", dir, err)
-			return
-		}
+	if store.db, err = leveldb_handle.OpenFile(dir, opts); err != nil {
+		glog.Infof("filer store open dir %s: %v", dir, err)
 	}
 	return
 }
@@ -72,6 +73,15 @@ func (store *LevelDBStore) RollbackTransaction(ctx context.Context) error {
 	return nil
 }
 
+var syncWriteOptions = &opt.WriteOptions{Sync: true}
+
+func writeOptions(ctx context.Context) *opt.WriteOptions {
+	if filer.SyncWrite(ctx) {
+		return syncWriteOptions
+	}
+	return nil
+}
+
 func (store *LevelDBStore) InsertEntry(ctx context.Context, entry *filer.Entry) (err error) {
 	key := genKey(entry.DirAndName())
 
@@ -80,17 +90,17 @@ func (store *LevelDBStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
 	}
 
-	if len(entry.Chunks) > 50 {
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		value = weed_util.MaybeGzipData(value)
 	}
 
-	err = store.db.Put(key, value, nil)
+	err = store.db.Put(key, value, writeOptions(ctx))
 
 	if err != nil {
 		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
 	}
 
-	// println("saved", entry.FullPath, "chunks", len(entry.Chunks))
+	// println("saved", entry.FullPath, "chunks", len(entry.GetChunks()))
 
 	return nil
 }
@@ -98,6 +108,39 @@ func (store *LevelDBStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 func (store *LevelDBStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
 	return store.InsertEntry(ctx, entry)
+}
+
+// BatchInsertEntries inserts multiple entries in a single LevelDB batch write.
+// This is more efficient than inserting entries one by one as it reduces
+// the number of write operations and syncs to disk.
+func (store *LevelDBStore) BatchInsertEntries(ctx context.Context, entries []*filer.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	batch := new(leveldb.Batch)
+
+	for _, entry := range entries {
+		key := genKey(entry.DirAndName())
+
+		value, err := entry.EncodeAttributesAndChunks()
+		if err != nil {
+			return fmt.Errorf("encoding %s %+v: %w", entry.FullPath, entry.Attr, err)
+		}
+
+		if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
+			value = weed_util.MaybeGzipData(value)
+		}
+
+		batch.Put(key, value)
+	}
+
+	err := store.db.Write(batch, nil)
+	if err != nil {
+		return fmt.Errorf("batch write: %w", err)
+	}
+
+	return nil
 }
 
 func (store *LevelDBStore) FindEntry(ctx context.Context, fullpath weed_util.FullPath) (entry *filer.Entry, err error) {
@@ -120,7 +163,7 @@ func (store *LevelDBStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 		return entry, fmt.Errorf("decode %s : %v", entry.FullPath, err)
 	}
 
-	// println("read", entry.FullPath, "chunks", len(entry.Chunks), "data", len(data), string(data))
+	// println("read", entry.FullPath, "chunks", len(entry.GetChunks()), "data", len(data), string(data))
 
 	return entry, nil
 }
@@ -128,7 +171,7 @@ func (store *LevelDBStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 func (store *LevelDBStore) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	key := genKey(fullpath.DirAndName())
 
-	err = store.db.Delete(key, nil)
+	err = store.db.Delete(key, writeOptions(ctx))
 	if err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
@@ -153,9 +196,13 @@ func (store *LevelDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 		}
 		batch.Delete([]byte(genKey(string(fullpath), fileName)))
 	}
+	iterErr := iter.Error()
 	iter.Release()
+	if iterErr != nil {
+		return fmt.Errorf("delete %s : %v", fullpath, iterErr)
+	}
 
-	err = store.db.Write(batch, nil)
+	err = store.db.Write(batch, writeOptions(ctx))
 
 	if err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
@@ -172,7 +219,7 @@ func (store *LevelDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 
 	directoryPrefix := genDirectoryKeyPrefix(dirPath, prefix)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart = genDirectoryKeyPrefix(dirPath, startFileName)
 	}
 
@@ -197,14 +244,24 @@ func (store *LevelDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		entry := &filer.Entry{
 			FullPath: weed_util.NewFullPath(string(dirPath), fileName),
 		}
-		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(iter.Value())); decodeErr != nil {
+		if decodeErr := filer.DecodeListedEntry(ctx, entry, weed_util.MaybeDecompressData(iter.Value())); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
 			break
 		}
+
+		if !resEachEntryFunc {
+			break
+		}
+	}
+	if err == nil {
+		err = iter.Error()
 	}
 	iter.Release()
 
@@ -240,4 +297,14 @@ func getNameFromKey(key []byte) string {
 
 func (store *LevelDBStore) Shutdown() {
 	store.db.Close()
+}
+
+func (store *LevelDBStore) Debug(writer io.Writer) {
+	iter := store.db.NewIterator(&leveldb_util.Range{}, nil)
+	for iter.Next() {
+		key := iter.Key()
+		fullName := bytes.Replace(key, []byte{DIR_FILE_SEPARATOR}, []byte{' '}, 1)
+		fmt.Fprintf(writer, "%v\n", string(fullName))
+	}
+	iter.Release()
 }

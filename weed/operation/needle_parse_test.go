@@ -2,15 +2,20 @@ package operation
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"math/rand"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type MockClient struct {
@@ -18,7 +23,7 @@ type MockClient struct {
 }
 
 func (m *MockClient) Do(req *http.Request) (*http.Response, error) {
-	n, originalSize, _, err := needle.CreateNeedleFromRequest(req, false, 1024*1024)
+	n, originalSize, _, err := needle.CreateNeedleFromRequest(req, false, 1024*1024, &bytes.Buffer{})
 	if m.needleHandling != nil {
 		m.needleHandling(n, originalSize, err)
 	}
@@ -38,22 +43,27 @@ If the content is already compressed, need to know the content size.
 */
 
 func TestCreateNeedleFromRequest(t *testing.T) {
-	mc := &MockClient{}
-	tmp := HttpClient
-	HttpClient = mc
-	defer func() {
-		HttpClient = tmp
-	}()
+	mockClient := &MockClient{}
+	uploader := newUploader(mockClient)
 
 	{
-		mc.needleHandling = func(n *needle.Needle, originalSize int, err error) {
+		mockClient.needleHandling = func(n *needle.Needle, originalSize int, err error) {
 			assert.Equal(t, nil, err, "upload: %v", err)
-			assert.Equal(t, "", string(n.Mime), "mime detection failed: %v", string(n.Mime))
+			assert.Equal(t, "text/plain; charset=utf-8", string(n.Mime), "mime detection failed: %v", string(n.Mime))
 			assert.Equal(t, true, n.IsCompressed(), "this should be compressed")
 			assert.Equal(t, true, util.IsGzippedContent(n.Data), "this should be gzip")
 			fmt.Printf("needle: %v, originalSize: %d\n", n, originalSize)
 		}
-		uploadResult, err, data := Upload("http://localhost:8080/389,0f084d17353afda0", "t.txt", false, bytes.NewReader([]byte(textContent)), false, "", nil, "")
+		uploadOption := &UploadOption{
+			UploadUrl:         "http://localhost:8080/389,0f084d17353afda0",
+			Filename:          "t.txt",
+			Cipher:            false,
+			IsInputCompressed: false,
+			MimeType:          "",
+			PairMap:           nil,
+			Jwt:               "",
+		}
+		uploadResult, err, data := uploader.Upload(context.Background(), bytes.NewReader([]byte(textContent)), uploadOption)
 		if len(data) != len(textContent) {
 			t.Errorf("data actual %d expected %d", len(data), len(textContent))
 		}
@@ -64,7 +74,7 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 	}
 
 	{
-		mc.needleHandling = func(n *needle.Needle, originalSize int, err error) {
+		mockClient.needleHandling = func(n *needle.Needle, originalSize int, err error) {
 			assert.Equal(t, nil, err, "upload: %v", err)
 			assert.Equal(t, "text/plain", string(n.Mime), "mime detection failed: %v", string(n.Mime))
 			assert.Equal(t, true, n.IsCompressed(), "this should be compressed")
@@ -72,7 +82,16 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 			fmt.Printf("needle: %v, dataSize:%d originalSize:%d\n", n, len(n.Data), originalSize)
 		}
 		gzippedData, _ := util.GzipData([]byte(textContent))
-		Upload("http://localhost:8080/389,0f084d17353afda0", "t.txt", false, bytes.NewReader(gzippedData), true, "text/plain", nil, "")
+		uploadOption := &UploadOption{
+			UploadUrl:         "http://localhost:8080/389,0f084d17353afda0",
+			Filename:          "t.txt",
+			Cipher:            false,
+			IsInputCompressed: true,
+			MimeType:          "text/plain",
+			PairMap:           nil,
+			Jwt:               "",
+		}
+		uploader.Upload(context.Background(), bytes.NewReader(gzippedData), uploadOption)
 	}
 
 	/*
@@ -101,6 +120,116 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 		}
 	*/
 
+}
+
+func TestUploadKeepsMarginalGzipUncompressed(t *testing.T) {
+	data := make([]byte, 4450)
+	rand.New(rand.NewSource(1)).Read(data[:4000])
+	gzipped, _ := util.GzipData(data)
+	if len(gzipped) >= len(data) || len(gzipped)*10 < len(data)*9 {
+		t.Fatalf("gzip size %d of %d is not a marginal saving", len(gzipped), len(data))
+	}
+
+	mockClient := &MockClient{}
+	var stored *needle.Needle
+	mockClient.needleHandling = func(n *needle.Needle, originalSize int, err error) {
+		assert.Equal(t, nil, err, "upload: %v", err)
+		stored = n
+	}
+	uploadOption := &UploadOption{
+		UploadUrl: "http://localhost:8080/389,0f084d17353afda0",
+		Filename:  "doc.pdf",
+		MimeType:  "application/pdf",
+	}
+	newUploader(mockClient).Upload(context.Background(), bytes.NewReader(data), uploadOption)
+	if stored == nil {
+		t.Fatal("no needle reached the volume server")
+	}
+	assert.False(t, stored.IsCompressed(), "gzip saved less than 10%, data should stay uncompressed")
+	assert.Equal(t, data, stored.Data)
+}
+
+type storingClient struct {
+	stored      *needle.Needle
+	contentType string
+}
+
+func (c *storingClient) Do(req *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	_, params, _ := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	part, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).NextPart()
+	if err != nil {
+		return nil, err
+	}
+	c.contentType = part.Header.Get("Content-Type")
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	n, _, _, err := needle.CreateNeedleFromRequest(req, false, 1024*1024, &bytes.Buffer{})
+	if err != nil {
+		return nil, err
+	}
+	c.stored = n
+	return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+}
+
+func TestUploadProbesGenericBinaryMimeTypes(t *testing.T) {
+	zeros := make([]byte, 64*1024)
+	random := make([]byte, 64*1024)
+	rand.New(rand.NewSource(1)).Read(random)
+	for _, tc := range []struct {
+		mimeType string
+		data     []byte
+		gzipped  bool
+	}{
+		{"", zeros, true},
+		{"application/octet-stream", zeros, true},
+		{"binary/octet-stream", zeros, true},
+		{"Application/Octet-Stream; charset=binary", zeros, true},
+		{"application/octet-stream", random, false},
+		{"video/mp4", zeros, false},
+	} {
+		client := &storingClient{}
+		result, err := newUploader(client).UploadData(context.Background(), tc.data, &UploadOption{
+			UploadUrl: "http://localhost:8080/389,0f084d17353afda0",
+			MimeType:  tc.mimeType,
+		})
+		if err != nil || client.stored == nil {
+			t.Fatalf("%q: upload: %v", tc.mimeType, err)
+		}
+		assert.Equal(t, tc.gzipped, client.stored.IsCompressed(), "mime %q", tc.mimeType)
+		assert.Equal(t, tc.gzipped, result.Gzip > 0, "mime %q", tc.mimeType)
+		if tc.mimeType != "" {
+			assert.Equal(t, tc.mimeType, client.contentType)
+		}
+		if tc.gzipped {
+			unzipped, err := util.DecompressData(client.stored.Data)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.data, unzipped)
+		}
+	}
+}
+
+func TestReplicationKeepsTheSourceMime(t *testing.T) {
+	for _, mimeType := range []string{"", "application/octet-stream", "Text/Plain; charset=UTF-8"} {
+		mockClient := &MockClient{}
+		var stored *needle.Needle
+		mockClient.needleHandling = func(n *needle.Needle, originalSize int, err error) {
+			assert.Equal(t, nil, err, "upload: %v", err)
+			stored = n
+		}
+		newUploader(mockClient).UploadData(context.Background(), []byte(textContent), &UploadOption{
+			UploadUrl:     "http://localhost:8080/389,0f084d17353afda0?type=replicate",
+			Filename:      "report.html",
+			MimeType:      mimeType,
+			IsReplication: true,
+		})
+		if stored == nil {
+			t.Fatal("no needle reached the volume server")
+		}
+		assert.Equal(t, mimeType, string(stored.Mime))
+	}
 }
 
 var textContent = `Redistribution and use in source and binary forms, with or without

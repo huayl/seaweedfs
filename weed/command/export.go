@@ -13,13 +13,13 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle_map"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
@@ -148,6 +148,9 @@ func (scanner *VolumeFileScanner4Export) VisitNeedle(n *needle.Needle, offset in
 
 func runExport(cmd *Command, args []string) bool {
 
+	*export.dir = util.ResolvePath(*export.dir)
+	*output = util.ResolvePath(*output)
+
 	var err error
 
 	if *newer != "" {
@@ -200,7 +203,7 @@ func runExport(cmd *Command, args []string) bool {
 	needleMap := needle_map.NewMemDb()
 	defer needleMap.Close()
 
-	if err := needleMap.LoadFromIdx(path.Join(util.ResolvePath(*export.dir), fileName+".idx")); err != nil {
+	if err := needleMap.LoadFromIdx(path.Join(*export.dir, fileName+".idx")); err != nil {
 		glog.Fatalf("cannot load needle map from %s.idx: %s", fileName, err)
 	}
 
@@ -213,7 +216,7 @@ func runExport(cmd *Command, args []string) bool {
 		fmt.Printf("key\tname\tsize\tgzip\tmime\tmodified\tttl\tdeleted\tstart\tstop\n")
 	}
 
-	err = storage.ScanVolumeFile(util.ResolvePath(*export.dir), *export.collection, vid, storage.NeedleMapInMemory, volumeFileScanner)
+	err = storage.ScanVolumeFile(*export.dir, *export.collection, vid, storage.NeedleMapInMemory, volumeFileScanner)
 	if err != nil && err != io.EOF {
 		glog.Errorf("Export Volume File [ERROR] %s\n", err)
 	}

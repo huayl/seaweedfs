@@ -2,14 +2,12 @@ package filer
 
 import (
 	"bytes"
-	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
-	"io/ioutil"
-	"math"
-	"net/http"
+	"context"
+	"crypto/md5"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.SeaweedFilerClient, dir, name string, byteBuffer *bytes.Buffer) error {
@@ -18,7 +16,7 @@ func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.Seaweed
 		Directory: dir,
 		Name:      name,
 	}
-	respLookupEntry, err := filer_pb.LookupEntry(filerClient, request)
+	respLookupEntry, err := filer_pb.LookupEntry(context.Background(), filerClient, request)
 	if err != nil {
 		return err
 	}
@@ -27,86 +25,64 @@ func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.Seaweed
 		return err
 	}
 
-	return StreamContent(masterClient, byteBuffer, respLookupEntry.Entry.Chunks, 0, math.MaxInt64, false)
+	return StreamContent(masterClient, byteBuffer, respLookupEntry.Entry.GetChunks(), 0, int64(FileSize(respLookupEntry.Entry)))
 
 }
 
-func ReadContent(filerAddress string, dir, name string) ([]byte, error) {
-
-	target := fmt.Sprintf("http://%s%s/%s", filerAddress, dir, name)
-
-	data, _, err := util.Get(target)
-
-	return data, err
+func ReadInsideFiler(ctx context.Context, filerClient filer_pb.SeaweedFilerClient, dir, name string) (content []byte, err error) {
+	request := &filer_pb.LookupDirectoryEntryRequest{
+		Directory: dir,
+		Name:      name,
+	}
+	respLookupEntry, err := filer_pb.LookupEntry(ctx, filerClient, request)
+	if err != nil {
+		return
+	}
+	content = respLookupEntry.Entry.Content
+	return
 }
 
-func SaveAs(host string, port int, dir, name string, contentType string, byteBuffer *bytes.Buffer) error {
-	var target string
-	if port == 0 {
-		target = fmt.Sprintf("http://%s%s/%s", host, dir, name)
-	} else {
-		target = fmt.Sprintf("http://%s:%d%s/%s", host, port, dir, name)
-	}
+// SaveInsideFiler writes content into the entry's inline Content. The content
+// MD5 is stamped on every write so the entry's ETag always describes what is
+// actually stored: conditional writers key IF_ETAG_MATCH off it, and a hash
+// left behind by an earlier write would make that condition pass against
+// content that has since changed.
+func SaveInsideFiler(ctx context.Context, client filer_pb.SeaweedFilerClient, dir, name string, content []byte) error {
 
-	// set the HTTP method, url, and request body
-	req, err := http.NewRequest(http.MethodPut, target, byteBuffer)
-	if err != nil {
-		return err
-	}
-
-	// set the request header Content-Type for json
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer util.CloseResponse(resp)
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("%s: %s %v", target, resp.Status, string(b))
-	}
-
-	return nil
-
-}
-
-func SaveInsideFiler(client filer_pb.SeaweedFilerClient, dir, name string, content []byte) error {
-
-	resp, err := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+	resp, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
 		Directory: dir,
 		Name:      name,
 	})
 
+	contentMd5 := md5.Sum(content)
+
 	if err == filer_pb.ErrNotFound {
-		err = filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+		err = filer_pb.CreateEntry(ctx, client, &filer_pb.CreateEntryRequest{
 			Directory: dir,
 			Entry: &filer_pb.Entry{
 				Name:        name,
 				IsDirectory: false,
 				Attributes: &filer_pb.FuseAttributes{
-					Mtime:       time.Now().Unix(),
-					Crtime:      time.Now().Unix(),
-					FileMode:    uint32(0644),
-					Collection:  "",
-					Replication: "",
-					FileSize:    uint64(len(content)),
+					Mtime:    time.Now().Unix(),
+					Crtime:   time.Now().Unix(),
+					FileMode: uint32(0644),
+					FileSize: uint64(len(content)),
+					Md5:      contentMd5[:],
 				},
 				Content: content,
 			},
+			SkipCheckParentDirectory: false,
 		})
 	} else if err == nil {
 		entry := resp.Entry
+		if bytes.Equal(entry.Content, content) && bytes.Equal(entry.GetAttributes().GetMd5(), contentMd5[:]) {
+			return nil
+		}
 		entry.Content = content
 		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = uint64(len(content))
-		err = filer_pb.UpdateEntry(client, &filer_pb.UpdateEntryRequest{
+		entry.Attributes.Md5 = contentMd5[:]
+		err = filer_pb.UpdateEntry(ctx, client, &filer_pb.UpdateEntryRequest{
 			Directory: dir,
 			Entry:     entry,
 		})

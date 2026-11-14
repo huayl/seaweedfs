@@ -3,11 +3,13 @@ package shell
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"google.golang.org/grpc"
 )
 
@@ -32,20 +34,30 @@ func (c *commandVolumeUnmount) Help() string {
 `
 }
 
-func (c *commandVolumeUnmount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+func (c *commandVolumeUnmount) HasTag(CommandTag) bool {
+	return false
+}
 
-	if err = commandEnv.confirmIsLocked(); err != nil {
-		return
-	}
+func (c *commandVolumeUnmount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	volUnmountCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	volumeIdInt := volUnmountCommand.Int("volumeId", 0, "the volume id")
 	nodeStr := volUnmountCommand.String("node", "", "the volume server <host>:<port>")
 	if err = volUnmountCommand.Parse(args); err != nil {
-		return nil
+		return err
+	}
+	if *nodeStr == "" {
+		return fmt.Errorf("-node option is required")
+	}
+	if *volumeIdInt == 0 {
+		return fmt.Errorf("-volumeId option is required")
 	}
 
-	sourceVolumeServer := *nodeStr
+	if err = commandEnv.confirmIsLocked(args); err != nil {
+		return
+	}
+
+	sourceVolumeServer := pb.ServerAddress(*nodeStr)
 
 	volumeId := needle.VolumeId(*volumeIdInt)
 
@@ -53,8 +65,8 @@ func (c *commandVolumeUnmount) Do(args []string, commandEnv *CommandEnv, writer 
 
 }
 
-func unmountVolume(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, sourceVolumeServer string) (err error) {
-	return operation.WithVolumeServerClient(sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+func unmountVolume(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, sourceVolumeServer pb.ServerAddress) (err error) {
+	return operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		_, unmountErr := volumeServerClient.VolumeUnmount(context.Background(), &volume_server_pb.VolumeUnmountRequest{
 			VolumeId: uint32(volumeId),
 		})

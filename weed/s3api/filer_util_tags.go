@@ -1,21 +1,23 @@
 package s3api
 
 import (
+	"context"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	xhttp "github.com/chrislusf/seaweedfs/weed/s3api/http"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 )
 
 const (
-	S3TAG_PREFIX = xhttp.AmzObjectTagging + "-"
+	S3TAG_PREFIX = s3_constants.AmzObjectTagging + "-"
 )
 
 func (s3a *S3ApiServer) getTags(parentDirectoryPath string, entryName string) (tags map[string]string, err error) {
 
-	err = s3a.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
-		resp, err := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+		resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: parentDirectoryPath,
 			Name:      entryName,
 		})
@@ -33,11 +35,11 @@ func (s3a *S3ApiServer) getTags(parentDirectoryPath string, entryName string) (t
 	return
 }
 
-func (s3a *S3ApiServer) setTags(parentDirectoryPath string, entryName string, tags map[string]string) (err error) {
+func (s3a *S3ApiServer) setTags(owner pb.ServerAddress, parentDirectoryPath string, entryName string, tags map[string]string) (err error) {
 
-	return s3a.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	return s3a.withWriteOwnerFilerClient(owner, func(client filer_pb.SeaweedFilerClient) error {
 
-		resp, err := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+		resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: parentDirectoryPath,
 			Name:      entryName,
 		})
@@ -58,7 +60,7 @@ func (s3a *S3ApiServer) setTags(parentDirectoryPath string, entryName string, ta
 			resp.Entry.Extended[S3TAG_PREFIX+k] = []byte(v)
 		}
 
-		return filer_pb.UpdateEntry(client, &filer_pb.UpdateEntryRequest{
+		return filer_pb.UpdateEntry(context.Background(), client, &filer_pb.UpdateEntryRequest{
 			Directory:          parentDirectoryPath,
 			Entry:              resp.Entry,
 			IsFromOtherCluster: false,
@@ -69,11 +71,11 @@ func (s3a *S3ApiServer) setTags(parentDirectoryPath string, entryName string, ta
 
 }
 
-func (s3a *S3ApiServer) rmTags(parentDirectoryPath string, entryName string) (err error) {
+func (s3a *S3ApiServer) rmTags(owner pb.ServerAddress, parentDirectoryPath string, entryName string) (err error) {
 
-	return s3a.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	return s3a.withWriteOwnerFilerClient(owner, func(client filer_pb.SeaweedFilerClient) error {
 
-		resp, err := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+		resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: parentDirectoryPath,
 			Name:      entryName,
 		})
@@ -93,7 +95,7 @@ func (s3a *S3ApiServer) rmTags(parentDirectoryPath string, entryName string) (er
 			return nil
 		}
 
-		return filer_pb.UpdateEntry(client, &filer_pb.UpdateEntryRequest{
+		return filer_pb.UpdateEntry(context.Background(), client, &filer_pb.UpdateEntryRequest{
 			Directory:          parentDirectoryPath,
 			Entry:              resp.Entry,
 			IsFromOtherCluster: false,

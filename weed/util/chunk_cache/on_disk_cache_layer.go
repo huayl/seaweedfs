@@ -3,11 +3,11 @@ package chunk_cache
 import (
 	"fmt"
 	"path"
-	"sort"
+	"slices"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 type OnDiskCacheLayer struct {
@@ -33,14 +33,17 @@ func NewOnDiskCacheLayer(dir, namePrefix string, diskSize int64, segmentCount in
 	}
 
 	// keep newest cache to the front
-	sort.Slice(c.diskCaches, func(i, j int) bool {
-		return c.diskCaches[i].lastModTime.After(c.diskCaches[j].lastModTime)
+	slices.SortFunc(c.diskCaches, func(a, b *ChunkCacheVolume) int {
+		return b.lastModTime.Compare(a.lastModTime)
 	})
-
 	return c
 }
 
 func (c *OnDiskCacheLayer) setChunk(needleId types.NeedleId, data []byte) {
+
+	if len(c.diskCaches) == 0 {
+		return
+	}
 
 	if c.diskCaches[0].fileSize+int64(len(data)) > c.diskCaches[0].sizeLimit {
 		t, resetErr := c.diskCaches[len(c.diskCaches)-1].Reset()
@@ -60,25 +63,23 @@ func (c *OnDiskCacheLayer) setChunk(needleId types.NeedleId, data []byte) {
 
 }
 
-func (c *OnDiskCacheLayer) getChunk(needleId types.NeedleId) (data []byte) {
-
-	var err error
+func (c *OnDiskCacheLayer) readChunkAt(buffer []byte, needleId types.NeedleId, offset uint64) (n int, err error) {
 
 	for _, diskCache := range c.diskCaches {
-		data, err = diskCache.GetNeedle(needleId)
+		n, err = diskCache.readNeedleSliceAt(buffer, needleId, offset)
 		if err == storage.ErrorNotFound {
 			continue
 		}
 		if err != nil {
-			glog.Errorf("failed to read cache file %s id %d", diskCache.fileName, needleId)
+			glog.Warningf("failed to read cache file %s id %d: %v", diskCache.fileName, needleId, err)
 			continue
 		}
-		if len(data) != 0 {
+		if n > 0 {
 			return
 		}
 	}
 
-	return nil
+	return
 
 }
 

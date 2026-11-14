@@ -1,3 +1,4 @@
+//go:build rocksdb
 // +build rocksdb
 
 package rocksdb
@@ -6,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 )
 
 func (store *RocksDBStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
@@ -14,7 +15,7 @@ func (store *RocksDBStore) KvPut(ctx context.Context, key []byte, value []byte) 
 	err = store.db.Put(store.wo, key, value)
 
 	if err != nil {
-		return fmt.Errorf("kv put: %v", err)
+		return fmt.Errorf("kv put: %w", err)
 	}
 
 	return nil
@@ -29,7 +30,7 @@ func (store *RocksDBStore) KvGet(ctx context.Context, key []byte) (value []byte,
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("kv get: %v", err)
+		return nil, fmt.Errorf("kv get: %w", err)
 	}
 
 	return
@@ -40,7 +41,7 @@ func (store *RocksDBStore) KvDelete(ctx context.Context, key []byte) (err error)
 	err = store.db.Delete(store.wo, key)
 
 	if err != nil {
-		return fmt.Errorf("kv delete: %v", err)
+		return fmt.Errorf("kv delete: %w", err)
 	}
 
 	return nil

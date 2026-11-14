@@ -1,13 +1,13 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"math"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -28,7 +28,15 @@ func (c *commandFsCat) Help() string {
 `
 }
 
+func (c *commandFsCat) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
 
 	path, err := commandEnv.parseUrl(findInputDirectory(args))
 	if err != nil {
@@ -41,18 +49,23 @@ func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Write
 
 	dir, name := util.FullPath(path).DirAndName()
 
-	return commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	return commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.LookupDirectoryEntryRequest{
 			Name:      name,
 			Directory: dir,
 		}
-		respLookupEntry, err := filer_pb.LookupEntry(client, request)
+		respLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, request)
 		if err != nil {
 			return err
 		}
 
-		return filer.StreamContent(commandEnv.MasterClient, writer, respLookupEntry.Entry.Chunks, 0, math.MaxInt64, false)
+		if len(respLookupEntry.Entry.Content) > 0 {
+			_, err = writer.Write(respLookupEntry.Entry.Content)
+			return err
+		}
+
+		return filer.StreamContent(commandEnv.MasterClient, writer, respLookupEntry.Entry.GetChunks(), 0, int64(filer.FileSize(respLookupEntry.Entry)))
 
 	})
 

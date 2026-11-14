@@ -2,23 +2,32 @@ package command
 
 import (
 	"fmt"
+	"os"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/shell"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/shell"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
-	shellOptions      shell.ShellOptions
-	shellInitialFiler *string
-	shellCluster      *string
+	shellOptions        shell.ShellOptions
+	shellInitialFiler   *string
+	shellCluster        *string
+	shellDebug          *bool
+	shellConnectTimeout *time.Duration
 )
 
 func init() {
 	cmdShell.Run = runShell // break init cycle
 	shellOptions.Masters = cmdShell.Flag.String("master", "", "comma-separated master servers, e.g. localhost:9333")
-	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port, e.g. localhost:8888")
+	shellOptions.FilerGroup = cmdShell.Flag.String("filerGroup", "", "filerGroup for the filers")
+	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port for initial connection, e.g. localhost:8888")
 	shellCluster = cmdShell.Flag.String("cluster", "", "cluster defined in shell.toml")
+	shellDebug = cmdShell.Flag.Bool("debug", false, "print informational logs to stderr")
+	shellConnectTimeout = cmdShell.Flag.Duration("connectTimeout", 30*time.Second, "timeout for the initial master connection and filer discovery")
 }
 
 var cmdShell = &Command{
@@ -28,40 +37,46 @@ var cmdShell = &Command{
 
 	Generate shell.toml via "weed scaffold -config=shell"
 
-  `,
+`,
 }
 
 func runShell(command *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	shellOptions.GrpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
-
-	if *shellOptions.Masters == "" && *shellInitialFiler == "" {
-		util.LoadConfiguration("shell", false)
-		v := util.GetViper()
-		cluster := v.GetString("cluster.default")
-		if *shellCluster != "" {
-			cluster = *shellCluster
-		}
-		if cluster == "" {
-			*shellOptions.Masters, *shellInitialFiler = "localhost:9333", "localhost:8888"
-		} else {
-			*shellOptions.Masters = v.GetString("cluster." + cluster + ".master")
-			*shellInitialFiler = v.GetString("cluster." + cluster + ".filer")
-		}
-	}
-
-	fmt.Printf("master: %s filer: %s\n", *shellOptions.Masters, *shellInitialFiler)
-
-	var err error
-	shellOptions.FilerHost, shellOptions.FilerPort, err = util.ParseHostPort(*shellInitialFiler)
-	if err != nil {
-		fmt.Printf("failed to parse filer %s: %v\n", *shellInitialFiler, err)
-		return false
-	}
 	shellOptions.Directory = "/"
 
-	shell.RunShell(shellOptions)
+	util.LoadConfiguration("shell", false)
+	viper := util.GetViper()
+	cluster := viper.GetString("cluster.default")
+	if *shellCluster != "" {
+		cluster = *shellCluster
+	}
+
+	if *shellOptions.Masters == "" {
+		if cluster == "" {
+			*shellOptions.Masters = "localhost:9333"
+		} else {
+			*shellOptions.Masters = viper.GetString("cluster." + cluster + ".master")
+		}
+	}
+
+	filerAddress := *shellInitialFiler
+	if filerAddress == "" && cluster != "" {
+		filerAddress = viper.GetString("cluster." + cluster + ".filer")
+	}
+	shellOptions.FilerAddress = pb.ServerAddress(filerAddress)
+	shellOptions.Debug = *shellDebug
+	shellOptions.ConnectTimeout = *shellConnectTimeout
+	if shellOptions.Debug {
+		fmt.Fprintf(os.Stderr, "master: %s filer: %s\n", *shellOptions.Masters, shellOptions.FilerAddress)
+	}
+
+	if err := shell.RunShell(shellOptions); err != nil {
+		// The command already printed the error; a piped run has to fail the
+		// script wrapping it too.
+		SetCommandExitStatus(1)
+	}
 
 	return true
 

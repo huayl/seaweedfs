@@ -1,15 +1,17 @@
 package needle
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/images"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/images"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 const (
@@ -30,9 +32,9 @@ type Needle struct {
 	Data         []byte `comment:"The actual file data"`
 	Flags        byte   `comment:"boolean flags"` //version2
 	NameSize     uint8  //version2
-	Name         []byte `comment:"maximum 256 characters"` //version2
+	Name         []byte `comment:"maximum 255 characters"` //version2
 	MimeSize     uint8  //version2
-	Mime         []byte `comment:"maximum 256 characters"` //version2
+	Mime         []byte `comment:"maximum 255 characters"` //version2
 	PairsSize    uint16 //version2
 	Pairs        []byte `comment:"additional name value pairs, json format, maximum 64kB"`
 	LastModified uint64 //only store LastModifiedBytesLength bytes, which is 5 bytes to disk
@@ -48,9 +50,9 @@ func (n *Needle) String() (str string) {
 	return
 }
 
-func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit int64) (n *Needle, originalSize int, contentMd5 string, e error) {
+func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit int64, bytesBuffer *bytes.Buffer) (n *Needle, originalSize int, contentMd5 string, e error) {
 	n = new(Needle)
-	pu, e := ParseUpload(r, sizeLimit)
+	pu, e := ParseUpload(r, sizeLimit, bytesBuffer)
 	if e != nil {
 		return
 	}
@@ -109,7 +111,8 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit 
 	commaSep := strings.LastIndex(r.URL.Path, ",")
 	dotSep := strings.LastIndex(r.URL.Path, ".")
 	fid := r.URL.Path[commaSep+1:]
-	if dotSep > 0 {
+	// dot must be after comma; otherwise path[commaSep+1:dotSep] panics
+	if dotSep > commaSep {
 		fid = r.URL.Path[commaSep+1 : dotSep]
 	}
 
@@ -133,12 +136,23 @@ func (n *Needle) ParsePath(fid string) (err error) {
 	}
 	if delta != "" {
 		if d, e := strconv.ParseUint(delta, 10, 64); e == nil {
+			if d > math.MaxUint64-uint64(n.Id) {
+				return fmt.Errorf("delta %d overflows needle id %x", d, n.Id)
+			}
 			n.Id += Uint64ToNeedleId(d)
 		} else {
 			return e
 		}
 	}
 	return err
+}
+
+func GetAppendAtNs(volumeLastAppendAtNs uint64) uint64 {
+	return max(uint64(time.Now().UnixNano()), volumeLastAppendAtNs+1)
+}
+
+func (n *Needle) UpdateAppendAtNs(volumeLastAppendAtNs uint64) {
+	n.AppendAtNs = max(uint64(time.Now().UnixNano()), volumeLastAppendAtNs+1)
 }
 
 func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
@@ -151,15 +165,22 @@ func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
 	split := len(key_hash_string) - CookieSize*2
 	needleId, err := ParseNeedleId(key_hash_string[:split])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %w", err)
 	}
 	cookie, err := ParseCookie(key_hash_string[split:])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %w", err)
 	}
 	return needleId, cookie, nil
 }
 
 func (n *Needle) LastModifiedString() string {
 	return time.Unix(int64(n.LastModified), 0).Format("2006-01-02T15:04:05")
+}
+
+func max(x, y uint64) uint64 {
+	if x <= y {
+		return y
+	}
+	return x
 }

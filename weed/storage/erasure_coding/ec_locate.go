@@ -1,34 +1,39 @@
 package erasure_coding
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 type Interval struct {
-	BlockIndex          int
+	BlockIndex          int // the index of the block in either the large blocks or the small blocks
 	InnerBlockOffset    int64
 	Size                types.Size
-	IsLargeBlock        bool
+	IsLargeBlock        bool // whether the block is a large block or a small block
 	LargeBlockRowsCount int
 }
 
-func LocateData(largeBlockLength, smallBlockLength int64, datSize int64, offset int64, size types.Size) (intervals []Interval) {
-	blockIndex, isLargeBlock, innerBlockOffset := locateOffset(largeBlockLength, smallBlockLength, datSize, offset)
-
-	// adding DataShardsCount*smallBlockLength to ensure we can derive the number of large block size from a shard size
-	nLargeBlockRows := int((datSize + DataShardsCount*smallBlockLength) / (largeBlockLength * DataShardsCount))
+// LocateData finds the intervals of data within erasure coding blocks for a given offset and size.
+func LocateData(largeBlockLength, smallBlockLength int64, shardDatSize int64, offset int64, size types.Size) (intervals []Interval) {
+	blockIndex, isLargeBlock, nLargeBlockRows, innerBlockOffset := locateOffset(largeBlockLength, smallBlockLength, shardDatSize, offset)
 
 	for size > 0 {
+		blockRemaining := largeBlockLength - innerBlockOffset
+		if !isLargeBlock {
+			blockRemaining = smallBlockLength - innerBlockOffset
+		}
+
+		if blockRemaining <= 0 {
+			// move to next block
+			blockIndex, isLargeBlock = moveToNextBlock(blockIndex, isLargeBlock, nLargeBlockRows)
+			innerBlockOffset = 0
+			continue
+		}
+
 		interval := Interval{
 			BlockIndex:          blockIndex,
 			InnerBlockOffset:    innerBlockOffset,
 			IsLargeBlock:        isLargeBlock,
-			LargeBlockRowsCount: nLargeBlockRows,
-		}
-
-		blockRemaining := largeBlockLength - innerBlockOffset
-		if !isLargeBlock {
-			blockRemaining = smallBlockLength - innerBlockOffset
+			LargeBlockRowsCount: int(nLargeBlockRows),
 		}
 
 		if int64(size) <= blockRemaining {
@@ -40,20 +45,26 @@ func LocateData(largeBlockLength, smallBlockLength int64, datSize int64, offset 
 		intervals = append(intervals, interval)
 
 		size -= interval.Size
-		blockIndex += 1
-		if isLargeBlock && blockIndex == nLargeBlockRows*DataShardsCount {
-			isLargeBlock = false
-			blockIndex = 0
-		}
+		blockIndex, isLargeBlock = moveToNextBlock(blockIndex, isLargeBlock, nLargeBlockRows)
 		innerBlockOffset = 0
 
 	}
 	return
 }
 
-func locateOffset(largeBlockLength, smallBlockLength int64, datSize int64, offset int64) (blockIndex int, isLargeBlock bool, innerBlockOffset int64) {
+func moveToNextBlock(blockIndex int, isLargeBlock bool, nLargeBlockRows int64) (int, bool) {
+	nextBlockIndex := blockIndex + 1
+	nextIsLargeBlock := isLargeBlock
+	if isLargeBlock && int64(nextBlockIndex) == nLargeBlockRows*DataShardsCount {
+		nextIsLargeBlock = false
+		nextBlockIndex = 0
+	}
+	return nextBlockIndex, nextIsLargeBlock
+}
+
+func locateOffset(largeBlockLength, smallBlockLength int64, shardDatSize int64, offset int64) (blockIndex int, isLargeBlock bool, nLargeBlockRows int64, innerBlockOffset int64) {
 	largeRowSize := largeBlockLength * DataShardsCount
-	nLargeBlockRows := datSize / (largeBlockLength * DataShardsCount)
+	nLargeBlockRows = shardDatSize / largeBlockLength
 
 	// if offset is within the large block area
 	if offset < nLargeBlockRows*largeRowSize {

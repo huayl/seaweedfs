@@ -1,4 +1,4 @@
-version: '2'
+version: '3.9'
 
 services:
   master:
@@ -14,7 +14,7 @@ services:
       - 9325:9325
     volumes:
       - /Volumes/mobile_disk/99:/data
-    command: 'volume -mserver="master:9333" -port=8080 -metricsPort=9325 -preStopSeconds=1 -publicUrl=localhost:7455'
+    command: 'volume -master="master:9333" -port=8080 -metricsPort=9325 -preStopSeconds=1 -publicUrl=localhost:7455'
     depends_on:
       - master
   filer:
@@ -40,7 +40,7 @@ services:
       - fuse
     volumes:
       - /Volumes/mobile_disk/99:/data
-    entrypoint: '/bin/sh -c "mkdir -p t1 && weed mount -filer=filer:8888 -dir=./t1 -cacheCapacityMB=0 -memprofile=/data/mount.mem.pprof"'
+    entrypoint: '/bin/sh -c "mkdir -p t1 && weed -v=4 mount -filer=filer:8888 -dir=./t1 -cacheCapacityMB=0 -memprofile=/data/mount.mem.pprof"'
     depends_on:
       - master
       - volume

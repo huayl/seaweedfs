@@ -4,6 +4,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/constants"
 )
 
 // APIError structure
@@ -15,11 +17,13 @@ type APIError struct {
 
 // RESTErrorResponse - error response format
 type RESTErrorResponse struct {
-	XMLName   xml.Name `xml:"Error" json:"-"`
-	Code      string   `xml:"Code" json:"Code"`
-	Message   string   `xml:"Message" json:"Message"`
-	Resource  string   `xml:"Resource" json:"Resource"`
-	RequestID string   `xml:"RequestId" json:"RequestId"`
+	XMLName    xml.Name `xml:"Error" json:"-"`
+	Code       string   `xml:"Code" json:"Code"`
+	Message    string   `xml:"Message" json:"Message"`
+	Resource   string   `xml:"Resource" json:"Resource"`
+	RequestID  string   `xml:"RequestId" json:"RequestId"`
+	Key        string   `xml:"Key,omitempty" json:"Key,omitempty"`
+	BucketName string   `xml:"BucketName,omitempty" json:"BucketName,omitempty"`
 
 	// Underlying HTTP status code for the returned error
 	StatusCode int `xml:"-" json:"-"`
@@ -49,15 +53,29 @@ const (
 	ErrBucketAlreadyExists
 	ErrBucketAlreadyOwnedByYou
 	ErrNoSuchBucket
+	ErrNoSuchBucketPolicy
+	ErrNoSuchCORSConfiguration
+	ErrNoSuchLifecycleConfiguration
+	ErrNoSuchWebsiteConfiguration
+	ErrReplicationConfigurationNotFound
 	ErrNoSuchKey
+	ErrNoSuchVersion
 	ErrNoSuchUpload
 	ErrInvalidBucketName
+	ErrInvalidBucketState
 	ErrInvalidDigest
+	ErrBadDigest
 	ErrInvalidMaxKeys
+	ErrInvalidMaxBuckets
+	ErrInvalidContinuationToken
 	ErrInvalidMaxUploads
 	ErrInvalidMaxParts
+	ErrInvalidMaxDeleteObjects
 	ErrInvalidPartNumberMarker
 	ErrInvalidPart
+	ErrInvalidPartNumber
+	ErrInvalidPartOrder
+	ErrInvalidRange
 	ErrInternalError
 	ErrInvalidCopyDest
 	ErrInvalidCopySource
@@ -76,12 +94,17 @@ const (
 	ErrMalformedDate
 	ErrMalformedPresignedDate
 	ErrMalformedCredentialDate
+	ErrMalformedPolicy
+	ErrInvalidPolicyDocument
+	ErrPolicyTooLarge
 	ErrMissingSignHeadersTag
 	ErrMissingSignTag
+	ErrAuthorizationHeaderMalformed
 	ErrUnsignedHeaders
 	ErrInvalidQueryParams
 	ErrInvalidQuerySignatureAlgo
 	ErrExpiredPresignRequest
+	ErrExpiredToken
 	ErrMalformedExpires
 	ErrNegativeExpires
 	ErrMaximumExpires
@@ -89,11 +112,81 @@ const (
 	ErrContentSHA256Mismatch
 	ErrInvalidAccessKeyID
 	ErrRequestNotReadyYet
+	ErrRequestTimeTooSkewed
 	ErrMissingDateHeader
 	ErrInvalidRequest
+	ErrInvalidArgument
+	ErrAuthNotSetup
 	ErrNotImplemented
+	ErrPreconditionFailed
+	ErrNotModified
 
 	ErrExistingObjectIsDirectory
+	ErrExistingObjectIsFile
+
+	ErrTooManyRequest
+	ErrRequestBytesExceed
+	ErrServiceUnavailable
+
+	OwnershipControlsNotFoundError
+	ErrNoSuchTagSet
+	ErrNoSuchObjectLockConfiguration
+	ErrNoSuchObjectLegalHold
+	ErrInvalidRetentionPeriod
+	ErrObjectLockConfigurationNotFoundError
+	ErrInvalidUnorderedWithDelimiter
+
+	// SSE-C related errors
+	ErrInvalidEncryptionAlgorithm
+	ErrInvalidEncryptionKey
+	ErrSSECustomerKeyMD5Mismatch
+	ErrSSECustomerKeyMissing
+	ErrSSECustomerKeyNotNeeded
+	ErrSSEEncryptionTypeMismatch
+	ErrInvalidEncryptionMethod
+	ErrIncompatibleEncryptionMethod
+
+	// SSE-KMS related errors
+	ErrKMSKeyNotFound
+	ErrKMSAccessDenied
+	ErrKMSDisabled
+	ErrKMSInvalidCiphertext
+
+	// Bucket encryption errors
+	ErrNoSuchBucketEncryptionConfiguration
+	ErrInvalidStorageClass
+
+	ErrInvalidMetadataDirective
+	ErrInvalidTagDirective
+
+	ErrInvalidAttributeName
+
+	// Object key length errors
+	ErrKeyTooLongError
+
+	ErrNoSuchConfiguration
+
+	// Truncated request body (fewer bytes than Content-Length)
+	ErrIncompleteBody
+
+	// Peer went away before the request body was fully received
+	ErrClientDisconnected
+
+	ErrInvalidRenameSource
+	ErrRenameDestinationSameAsSource
+	ErrIdempotentParameterMismatch
+	ErrAccessControlListNotSupported
+	// The request's snapshot changed during a conditional write; clients can retry.
+	ErrConditionalRequestConflict
+	ErrNoSuchPublicAccessBlockConfiguration
+)
+
+// Error message constants for checksum validation
+const (
+	ErrMsgContentSha256Mismatch     = "the provided 'x-amz-content-sha256' header does not match what was computed"
+	ErrMsgPayloadChecksumMismatch   = "payload checksum does not match"
+	ErrMsgChunkSignatureMismatch    = "chunk signature does not match"
+	ErrMsgChecksumAlgorithmMismatch = "checksum algorithm mismatch"
 )
 
 // error code to APIError structure, these fields carry respective
@@ -116,7 +209,7 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	},
 	ErrBucketAlreadyExists: {
 		Code:           "BucketAlreadyExists",
-		Description:    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again.",
+		Description:    "The requested bucket name is not available. The bucket name can not be an existing collection, and the bucket namespace is shared by all users of the system. Please select a different name and try again.",
 		HTTPStatusCode: http.StatusConflict,
 	},
 	ErrBucketAlreadyOwnedByYou: {
@@ -129,9 +222,19 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "The specified bucket is not valid.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidBucketState: {
+		Code:           "InvalidBucketState",
+		Description:    "The bucket is not in a valid state for the requested operation",
+		HTTPStatusCode: http.StatusConflict,
+	},
 	ErrInvalidDigest: {
 		Code:           "InvalidDigest",
 		Description:    "The Content-Md5 you specified is not valid.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrBadDigest: {
+		Code:           "BadDigest",
+		Description:    constants.ErrMsgBadDigest,
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidMaxUploads: {
@@ -144,9 +247,24 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Argument maxKeys must be an integer between 0 and 2147483647",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidMaxBuckets: {
+		Code:           "InvalidArgument",
+		Description:    "Argument max-buckets must be an integer between 1 and 10000",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidContinuationToken: {
+		Code:           "InvalidArgument",
+		Description:    "The continuation token provided is incorrect",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInvalidMaxParts: {
 		Code:           "InvalidArgument",
 		Description:    "Argument max-parts must be an integer between 0 and 2147483647",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidMaxDeleteObjects: {
+		Code:           "InvalidArgument",
+		Description:    "Argument objects can contain a list of up to 1000 keys",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidPartNumberMarker: {
@@ -159,9 +277,59 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "The specified bucket does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
+	ErrNoSuchBucketPolicy: {
+		Code:           "NoSuchBucketPolicy",
+		Description:    "The bucket policy does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchTagSet: {
+		Code:           "NoSuchTagSet",
+		Description:    "The TagSet does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchObjectLockConfiguration: {
+		Code:           "NoSuchObjectLockConfiguration",
+		Description:    "The specified object does not have an ObjectLock configuration",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchObjectLegalHold: {
+		Code:           "NoSuchObjectLegalHold",
+		Description:    "The specified object does not have a legal hold configuration",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrInvalidRetentionPeriod: {
+		Code:           "InvalidRetentionPeriod",
+		Description:    "The retention period specified is invalid",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrNoSuchCORSConfiguration: {
+		Code:           "NoSuchCORSConfiguration",
+		Description:    "The CORS configuration does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchLifecycleConfiguration: {
+		Code:           "NoSuchLifecycleConfiguration",
+		Description:    "The lifecycle configuration does not exist",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchWebsiteConfiguration: {
+		Code:           "NoSuchWebsiteConfiguration",
+		Description:    "The specified bucket does not have a website configuration",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrReplicationConfigurationNotFound: {
+		Code:           "ReplicationConfigurationNotFoundError",
+		Description:    "The replication configuration was not found",
+		HTTPStatusCode: http.StatusNotFound,
+	},
 	ErrNoSuchKey: {
 		Code:           "NoSuchKey",
 		Description:    "The specified key does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrNoSuchVersion: {
+		Code:           "NoSuchVersion",
+		Description:    "The specified version does not exist.",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrNoSuchUpload: {
@@ -174,10 +342,32 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "We encountered an internal error, please try again.",
 		HTTPStatusCode: http.StatusInternalServerError,
 	},
+	ErrIncompleteBody: {
+		Code:           "IncompleteBody",
+		Description:    "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	// 499 has no RFC; it is nginx's code for a client that went away, and is what
+	// log pipelines already recognise for this case.
+	ErrClientDisconnected: {
+		Code:           "ClientDisconnected",
+		Description:    "The client disconnected before the request body was fully received.",
+		HTTPStatusCode: 499,
+	},
 
 	ErrInvalidPart: {
 		Code:           "InvalidPart",
 		Description:    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPartNumber: {
+		Code:           "InvalidPartNumber",
+		Description:    "The requested partnumber is not satisfiable.",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
+	},
+	ErrInvalidPartOrder: {
+		Code:           "InvalidPartOrder",
+		Description:    "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
@@ -191,14 +381,46 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Copy Source must mention the source bucket and key: sourcebucket/sourcekey.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	ErrInvalidTag: {
+	ErrInvalidRenameSource: {
 		Code:           "InvalidArgument",
+		Description:    "Rename Source must mention the source bucket and key: sourcebucket/sourcekey.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrRenameDestinationSameAsSource: {
+		Code:           "InvalidRequest",
+		Description:    "This rename request is illegal because it is trying to rename an object to itself.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrIdempotentParameterMismatch: {
+		Code:        "IdempotentParameterMismatch",
+		Description: "The request uses the same client token as a previous, but non-identical request.",
+		// 400 Bad Request, matching the AWS S3 RenameObject API documentation
+		// for IdempotencyParameterMismatch.
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidTag: {
+		Code:           "InvalidTag",
 		Description:    "The Tag value you have provided is invalid",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMalformedXML: {
 		Code:           "MalformedXML",
 		Description:    "The XML you provided was not well-formed or did not validate against our published schema.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrMalformedPolicy: {
+		Code:           "MalformedPolicy",
+		Description:    "Policy has invalid resource.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrPolicyTooLarge: {
+		Code:           "PolicyTooLarge",
+		Description:    "Policy exceeds the maximum allowed document size.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPolicyDocument: {
+		Code:           "InvalidPolicyDocument",
+		Description:    "The content of the policy document is invalid.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrAuthHeaderEmpty: {
@@ -267,8 +489,13 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMissingSignTag: {
-		Code:           "AccessDenied",
+		Code:           "AuthorizationHeaderMalformed",
 		Description:    "Signature header missing Signature field.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAuthorizationHeaderMalformed: {
+		Code:           "AuthorizationHeaderMalformed",
+		Description:    "The authorization header is malformed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
@@ -291,6 +518,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "AccessDenied",
 		Description:    "Request has expired",
 		HTTPStatusCode: http.StatusForbidden,
+	},
+	ErrExpiredToken: {
+		Code:           "ExpiredToken",
+		Description:    "The provided token has expired.",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMalformedExpires: {
 		Code:           "AuthorizationQueryParametersError",
@@ -320,6 +552,12 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		HTTPStatusCode: http.StatusForbidden,
 	},
 
+	ErrRequestTimeTooSkewed: {
+		Code:           "RequestTimeTooSkewed",
+		Description:    "The difference between the request time and the server's time is too large.",
+		HTTPStatusCode: http.StatusForbidden,
+	},
+
 	ErrSignatureDoesNotMatch: {
 		Code:           "SignatureDoesNotMatch",
 		Description:    "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
@@ -334,11 +572,31 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrMissingDateHeader: {
 		Code:           "AccessDenied",
 		Description:    "AWS authentication requires a valid Date or x-amz-date header",
-		HTTPStatusCode: http.StatusBadRequest,
+		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrInvalidRequest: {
 		Code:           "InvalidRequest",
 		Description:    "Invalid Request",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidArgument: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid Argument",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAccessControlListNotSupported: {
+		Code:           "AccessControlListNotSupported",
+		Description:    "The bucket does not allow ACLs",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidRange: {
+		Code:           "InvalidRange",
+		Description:    "The requested range is not satisfiable",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
+	},
+	ErrAuthNotSetup: {
+		Code:           "InvalidRequest",
+		Description:    "Signed request requires setting up SeaweedFS S3 authentication",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrNotImplemented: {
@@ -346,10 +604,173 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "A header you provided implies functionality that is not implemented",
 		HTTPStatusCode: http.StatusNotImplemented,
 	},
+	ErrPreconditionFailed: {
+		Code:           "PreconditionFailed",
+		Description:    "At least one of the pre-conditions you specified did not hold",
+		HTTPStatusCode: http.StatusPreconditionFailed,
+	},
+	ErrConditionalRequestConflict: {
+		Code:           "ConditionalRequestConflict",
+		Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrNotModified: {
+		Code:           "NotModified",
+		Description:    "The object was not modified since the specified time",
+		HTTPStatusCode: http.StatusNotModified,
+	},
 	ErrExistingObjectIsDirectory: {
 		Code:           "ExistingObjectIsDirectory",
 		Description:    "Existing Object is a directory.",
 		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrExistingObjectIsFile: {
+		Code:           "ExistingObjectIsFile",
+		Description:    "Existing Object is a file.",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrTooManyRequest: {
+		Code:           "SlowDown",
+		Description:    "Too many simultaneous request count",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrRequestBytesExceed: {
+		Code:           "SlowDown",
+		Description:    "Simultaneous request bytes exceed limitations",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrServiceUnavailable: {
+		Code:           "ServiceUnavailable",
+		Description:    "Service Unavailable",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+
+	OwnershipControlsNotFoundError: {
+		Code:           "OwnershipControlsNotFoundError",
+		Description:    "The bucket ownership controls were not found",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrObjectLockConfigurationNotFoundError: {
+		Code:           "ObjectLockConfigurationNotFoundError",
+		Description:    "Object Lock configuration does not exist for this bucket",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrInvalidUnorderedWithDelimiter: {
+		Code:           "InvalidArgument",
+		Description:    "Unordered listing cannot be used with delimiter",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	// SSE-C related error mappings
+	ErrInvalidEncryptionAlgorithm: {
+		Code:           "InvalidEncryptionAlgorithmError",
+		Description:    "The encryption algorithm specified is not valid.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidEncryptionKey: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid encryption key. Encryption key must be 256-bit AES256.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSSECustomerKeyMD5Mismatch: {
+		Code:           "InvalidArgument",
+		Description:    "The provided customer encryption key MD5 does not match the key.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSSECustomerKeyMissing: {
+		Code:           "InvalidArgument",
+		Description:    "Requests specifying Server Side Encryption with Customer provided keys must provide the customer key.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSSECustomerKeyNotNeeded: {
+		Code:           "InvalidArgument",
+		Description:    "The object was not encrypted with customer provided keys.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSSEEncryptionTypeMismatch: {
+		Code:           "InvalidRequest",
+		Description:    "The encryption method specified in the request does not match the encryption method used to encrypt the object.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidEncryptionMethod: {
+		Code:           "InvalidArgument",
+		Description:    "The encryption method specified is not supported",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrIncompatibleEncryptionMethod: {
+		Code:           "InvalidArgument",
+		Description:    "Server Side Encryption with Customer provided key is incompatible with the encryption method specified",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	// SSE-KMS error responses
+	ErrKMSKeyNotFound: {
+		Code:           "KMSKeyNotFoundException",
+		Description:    "The specified KMS key does not exist.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrKMSAccessDenied: {
+		Code:           "KMSAccessDeniedException",
+		Description:    "Access denied to the specified KMS key.",
+		HTTPStatusCode: http.StatusForbidden,
+	},
+	ErrKMSDisabled: {
+		Code:           "KMSKeyDisabledException",
+		Description:    "The specified KMS key is disabled.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrKMSInvalidCiphertext: {
+		Code:           "InvalidCiphertext",
+		Description:    "The provided ciphertext is invalid or corrupted.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	// Bucket encryption error responses
+	ErrNoSuchBucketEncryptionConfiguration: {
+		Code:           "ServerSideEncryptionConfigurationNotFoundError",
+		Description:    "The server side encryption configuration was not found.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrInvalidStorageClass: {
+		Code:           "InvalidStorageClass",
+		Description:    "The storage class you specified is not valid",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidMetadataDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown metadata directive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidTagDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown tag directive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidAttributeName: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid attribute name specified",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrKeyTooLongError: {
+		Code:           "KeyTooLongError",
+		Description:    "Your key is too long.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrNoSuchConfiguration: {
+		Code:           "NoSuchConfiguration",
+		Description:    "The specified configuration does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+
+	ErrNoSuchPublicAccessBlockConfiguration: {
+		Code:           "NoSuchPublicAccessBlockConfiguration",
+		Description:    "The public access block configuration was not found",
+		HTTPStatusCode: http.StatusNotFound,
 	},
 }
 

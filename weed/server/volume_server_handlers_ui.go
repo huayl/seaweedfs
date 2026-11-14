@@ -5,17 +5,27 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	ui "github.com/chrislusf/seaweedfs/weed/server/volume_server_ui"
-	"github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	ui "github.com/seaweedfs/seaweedfs/weed/server/volume_server_ui"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
 
+// remoteVolumeRow carries the remote key the store no longer keeps per volume,
+// read from the volume this server holds rather than relayed by a master.
+type remoteVolumeRow struct {
+	*storage.VolumeInfo
+	RemoteStorageKey string
+}
+
 func (vs *VolumeServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+util.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
 	infos := make(map[string]interface{})
-	infos["Up Time"] = time.Now().Sub(startTime).String()
+	infos["Up Time"] = time.Since(startTime).Truncate(time.Second).String()
 	var ds []*volume_server_pb.DiskStatus
 	for _, loc := range vs.store.Locations {
 		if dir, e := filepath.Abs(loc.Directory); e == nil {
@@ -25,17 +35,22 @@ func (vs *VolumeServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	volumeInfos := vs.store.VolumeInfos()
-	var normalVolumeInfos, remoteVolumeInfos []*storage.VolumeInfo
+	var normalVolumeInfos []*storage.VolumeInfo
+	var remoteVolumeInfos []remoteVolumeRow
 	for _, vinfo := range volumeInfos {
-		if vinfo.IsRemote() {
-			remoteVolumeInfos = append(remoteVolumeInfos, vinfo)
-		} else {
+		if !vinfo.IsRemote() {
 			normalVolumeInfos = append(normalVolumeInfos, vinfo)
+			continue
 		}
+		row := remoteVolumeRow{VolumeInfo: vinfo}
+		if v := vs.store.GetVolume(vinfo.Id); v != nil {
+			_, row.RemoteStorageKey = v.RemoteStorageNameKey()
+		}
+		remoteVolumeInfos = append(remoteVolumeInfos, row)
 	}
 	args := struct {
 		Version       string
-		Masters       []string
+		Masters       []pb.ServerAddress
 		Volumes       interface{}
 		EcVolumes     interface{}
 		RemoteVolumes interface{}
@@ -43,7 +58,7 @@ func (vs *VolumeServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 		Stats         interface{}
 		Counters      *stats.ServerStats
 	}{
-		util.Version(),
+		version.Version(),
 		vs.SeedMasterNodes,
 		normalVolumeInfos,
 		vs.store.EcVolumes(),
@@ -52,5 +67,8 @@ func (vs *VolumeServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 		infos,
 		serverStats,
 	}
-	ui.StatusTpl.Execute(w, args)
+	if err := ui.StatusTpl.Execute(w, args); err != nil {
+		glog.Errorf("template execution error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }

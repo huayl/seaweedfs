@@ -2,13 +2,10 @@ package util
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"fmt"
-	"io/ioutil"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	// "github.com/klauspost/compress/zstd"
 )
 
@@ -42,17 +39,21 @@ func MaybeDecompressData(input []byte) []byte {
 }
 
 func GzipData(input []byte) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	w, _ := gzip.NewWriterLevel(buf, flate.BestSpeed)
-	if _, err := w.Write(input); err != nil {
-		glog.V(2).Infof("error gzip data: %v", err)
+	w := new(bytes.Buffer)
+	_, err := GzipStream(w, bytes.NewReader(input))
+	if err != nil {
 		return nil, err
 	}
-	if err := w.Close(); err != nil {
-		glog.V(2).Infof("error closing gzipped data: %v", err)
+	return w.Bytes(), nil
+}
+
+func ungzipData(input []byte) ([]byte, error) {
+	w := new(bytes.Buffer)
+	_, err := GunzipStream(w, bytes.NewReader(input))
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return w.Bytes(), nil
 }
 
 func DecompressData(input []byte) ([]byte, error) {
@@ -65,17 +66,6 @@ func DecompressData(input []byte) ([]byte, error) {
 		}
 	*/
 	return input, UnsupportedCompression
-}
-
-func ungzipData(input []byte) ([]byte, error) {
-	buf := bytes.NewBuffer(input)
-	r, _ := gzip.NewReader(buf)
-	defer r.Close()
-	output, err := ioutil.ReadAll(r)
-	if err != nil {
-		glog.V(2).Infof("error ungzip data: %v", err)
-	}
-	return output, err
 }
 
 func IsGzippedContent(data []byte) bool {
@@ -109,6 +99,12 @@ func IsZstdContent(data []byte) bool {
 /*
 * Default not to compressed since compression can be done on client side.
  */func IsCompressableFileType(ext, mtype string) (shouldBeCompressed, iAmSure bool) {
+	ext = strings.ToLower(ext)
+	// Match on the media type alone: "application/json; charset=utf-8" is JSON.
+	if i := strings.IndexByte(mtype, ';'); i >= 0 {
+		mtype = strings.TrimSpace(mtype[:i])
+	}
+	mtype = strings.ToLower(mtype)
 
 	// text
 	if strings.HasPrefix(mtype, "text/") {
@@ -126,7 +122,7 @@ func IsZstdContent(data []byte) bool {
 
 	// by file name extension
 	switch ext {
-	case ".zip", ".rar", ".gz", ".bz2", ".xz", ".zst":
+	case ".zip", ".rar", ".gz", ".bz2", ".xz", ".zst", ".br":
 		return false, true
 	case ".pdf", ".txt", ".html", ".htm", ".css", ".js", ".json":
 		return true, true
@@ -146,6 +142,13 @@ func IsZstdContent(data []byte) bool {
 		}
 		if strings.HasSuffix(mtype, "script") {
 			return true, true
+		}
+		// application/json, application/ld+json, application/x-ndjson, application/json-seq, ...
+		if strings.HasSuffix(mtype, "json") || strings.HasSuffix(mtype, "json-seq") {
+			return true, true
+		}
+		if strings.HasSuffix(mtype, "vnd.rar") {
+			return false, true
 		}
 	}
 

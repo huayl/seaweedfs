@@ -24,9 +24,10 @@ public class SeaweedRead {
 
     // returns bytesRead
     public static long read(FilerClient filerClient, List<VisibleInterval> visibleIntervals,
-                            final long position, final ByteBuffer buf, final long fileSize) throws IOException {
+            final long position, final ByteBuffer buf, final long fileSize) throws IOException {
 
-        List<ChunkView> chunkViews = viewFromVisibles(visibleIntervals, position, buf.remaining());
+        int originalRemaining = buf.remaining();
+        List<ChunkView> chunkViews = viewFromVisibles(visibleIntervals, position, originalRemaining);
 
         Map<String, FilerProto.Locations> knownLocations = new HashMap<>();
 
@@ -51,7 +52,7 @@ public class SeaweedRead {
             }
         }
 
-        //TODO parallel this
+        // TODO parallel this
         long readCount = 0;
         long startOffset = position;
         for (ChunkView chunkView : chunkViews) {
@@ -59,16 +60,17 @@ public class SeaweedRead {
             if (startOffset < chunkView.logicOffset) {
                 long gap = chunkView.logicOffset - startOffset;
                 LOG.debug("zero [{},{})", startOffset, startOffset + gap);
-                buf.position(buf.position()+ (int)gap);
+                buf.position(buf.position() + (int) gap);
                 readCount += gap;
                 startOffset += gap;
             }
 
-            FilerProto.Locations locations = knownLocations.get(parseVolumeId(chunkView.fileId));
+            String volumeId = parseVolumeId(chunkView.fileId);
+            FilerProto.Locations locations = knownLocations.get(volumeId);
             if (locations == null || locations.getLocationsCount() == 0) {
                 LOG.error("failed to locate {}", chunkView.fileId);
-                // log here!
-                return 0;
+                volumeIdCache.clearLocations(volumeId);
+                throw new IOException("failed to locate fileId " + chunkView.fileId);
             }
 
             int len = readChunkView(filerClient, startOffset, buf, chunkView, locations);
@@ -80,12 +82,17 @@ public class SeaweedRead {
 
         }
 
-        long limit = Math.min(buf.limit(), fileSize);
+        // Fix: Calculate the correct limit based on the read position and requested
+        // size,
+        // not the buffer's absolute limit. This fixes the 78-byte EOF error when
+        // seeking
+        // near the end of the file.
+        long limit = Math.min(position + originalRemaining, fileSize);
 
         if (startOffset < limit) {
             long gap = limit - startOffset;
             LOG.debug("zero2 [{},{})", startOffset, startOffset + gap);
-            buf.position(buf.position()+ (int)gap);
+            buf.position(buf.position() + (int) gap);
             readCount += gap;
             startOffset += gap;
         }
@@ -93,7 +100,8 @@ public class SeaweedRead {
         return readCount;
     }
 
-    private static int readChunkView(FilerClient filerClient, long startOffset, ByteBuffer buf, ChunkView chunkView, FilerProto.Locations locations) throws IOException {
+    private static int readChunkView(FilerClient filerClient, long startOffset, ByteBuffer buf, ChunkView chunkView,
+            FilerProto.Locations locations) throws IOException {
 
         byte[] chunkData = chunkCache.getChunk(chunkView.fileId);
 
@@ -102,15 +110,25 @@ public class SeaweedRead {
             chunkCache.setChunk(chunkView.fileId, chunkData);
         }
 
-        int len = (int) chunkView.size;
+        int len = (int) chunkView.size - (int) (startOffset - chunkView.logicOffset);
+        int srcOffset = (int) (startOffset - chunkView.logicOffset + chunkView.offset);
         LOG.debug("readChunkView fid:{} chunkData.length:{} chunkView.offset:{} chunkView[{};{}) startOffset:{}",
-                chunkView.fileId, chunkData.length, chunkView.offset, chunkView.logicOffset, chunkView.logicOffset + chunkView.size, startOffset);
-        buf.put(chunkData, (int) (startOffset - chunkView.logicOffset + chunkView.offset), len);
+                chunkView.fileId, chunkData.length, chunkView.offset, chunkView.logicOffset,
+                chunkView.logicOffset + chunkView.size, startOffset);
+        // The fetched chunk can be shorter than the view claims when a read briefly
+        // returns an empty body (seen right after an append). Fail clearly instead of
+        // letting ByteBuffer.put throw an opaque IndexOutOfBoundsException.
+        if (srcOffset < 0 || len < 0 || srcOffset > chunkData.length - len) {
+            throw new IOException("chunk " + chunkView.fileId + " returned " + chunkData.length
+                    + " bytes, need [" + srcOffset + "," + ((long) srcOffset + len) + ")");
+        }
+        buf.put(chunkData, srcOffset, len);
 
         return len;
     }
 
-    public static byte[] doFetchFullChunkData(FilerClient filerClient, ChunkView chunkView, FilerProto.Locations locations) throws IOException {
+    public static byte[] doFetchFullChunkData(FilerClient filerClient, ChunkView chunkView,
+            FilerProto.Locations locations) throws IOException {
 
         byte[] data = null;
         IOException lastException = null;
@@ -118,7 +136,15 @@ public class SeaweedRead {
             for (FilerProto.Location location : locations.getLocationsList()) {
                 String url = filerClient.getChunkUrl(chunkView.fileId, location.getUrl(), location.getPublicUrl());
                 try {
-                    data = doFetchOneFullChunkData(chunkView, url);
+                    byte[] fetched = doFetchOneFullChunkData(chunkView, url);
+                    // An empty (or null) body for a chunk we are reading from is never
+                    // valid; treat it as a transient failure so the retry loop tries
+                    // another location and backs off, rather than caching an empty chunk.
+                    if (fetched == null || fetched.length == 0) {
+                        lastException = new IOException("empty or null response for chunk " + chunkView.fileId + " from " + url);
+                        continue;
+                    }
+                    data = fetched;
                     lastException = null;
                     break;
                 } catch (IOException ioe) {
@@ -150,6 +176,11 @@ public class SeaweedRead {
         HttpGet request = new HttpGet(url);
 
         request.setHeader(HttpHeaders.ACCEPT_ENCODING, "gzip");
+
+        String basicAuthHeader = FilerSecurityContext.getBasicAuthHeaderValue();
+        if (basicAuthHeader != null) {
+            request.setHeader(HttpHeaders.AUTHORIZATION, basicAuthHeader);
+        }
 
         byte[] data = null;
 
@@ -213,8 +244,7 @@ public class SeaweedRead {
                         chunkStart,
                         isFullChunk,
                         chunk.cipherKey,
-                        chunk.isCompressed
-                ));
+                        chunk.isCompressed));
             }
         }
         return views;
@@ -225,96 +255,8 @@ public class SeaweedRead {
 
         chunkList = FileChunkManifest.resolveChunkManifest(filerClient, chunkList);
 
-        FilerProto.FileChunk[] chunks = chunkList.toArray(new FilerProto.FileChunk[0]);
-        Arrays.sort(chunks, new Comparator<FilerProto.FileChunk>() {
-            @Override
-            public int compare(FilerProto.FileChunk a, FilerProto.FileChunk b) {
-                // if just a.getMtime() - b.getMtime(), it will overflow!
-                if (a.getMtime() < b.getMtime()) {
-                    return -1;
-                } else if (a.getMtime() > b.getMtime()) {
-                    return 1;
-                }
-                return 0;
-            }
-        });
+        return ReadChunks.readResolvedChunks(chunkList);
 
-        List<VisibleInterval> visibles = new ArrayList<>();
-        for (FilerProto.FileChunk chunk : chunks) {
-            List<VisibleInterval> newVisibles = new ArrayList<>();
-            visibles = mergeIntoVisibles(visibles, newVisibles, chunk);
-        }
-
-        return visibles;
-    }
-
-    private static List<VisibleInterval> mergeIntoVisibles(List<VisibleInterval> visibles,
-                                                           List<VisibleInterval> newVisibles,
-                                                           FilerProto.FileChunk chunk) {
-        VisibleInterval newV = new VisibleInterval(
-                chunk.getOffset(),
-                chunk.getOffset() + chunk.getSize(),
-                chunk.getFileId(),
-                chunk.getMtime(),
-                0,
-                true,
-                chunk.getCipherKey().toByteArray(),
-                chunk.getIsCompressed()
-        );
-
-        // easy cases to speed up
-        if (visibles.size() == 0) {
-            visibles.add(newV);
-            return visibles;
-        }
-        if (visibles.get(visibles.size() - 1).stop <= chunk.getOffset()) {
-            visibles.add(newV);
-            return visibles;
-        }
-
-        for (VisibleInterval v : visibles) {
-            if (v.start < chunk.getOffset() && chunk.getOffset() < v.stop) {
-                newVisibles.add(new VisibleInterval(
-                        v.start,
-                        chunk.getOffset(),
-                        v.fileId,
-                        v.modifiedTime,
-                        v.chunkOffset,
-                        false,
-                        v.cipherKey,
-                        v.isCompressed
-                ));
-            }
-            long chunkStop = chunk.getOffset() + chunk.getSize();
-            if (v.start < chunkStop && chunkStop < v.stop) {
-                newVisibles.add(new VisibleInterval(
-                        chunkStop,
-                        v.stop,
-                        v.fileId,
-                        v.modifiedTime,
-                        v.chunkOffset + (chunkStop - v.start),
-                        false,
-                        v.cipherKey,
-                        v.isCompressed
-                ));
-            }
-            if (chunkStop <= v.start || v.stop <= chunk.getOffset()) {
-                newVisibles.add(v);
-            }
-        }
-        newVisibles.add(newV);
-
-        // keep everything sorted
-        for (int i = newVisibles.size() - 1; i >= 0; i--) {
-            if (i > 0 && newV.start < newVisibles.get(i - 1).start) {
-                newVisibles.set(i, newVisibles.get(i - 1));
-            } else {
-                newVisibles.set(i, newV);
-                break;
-            }
-        }
-
-        return newVisibles;
     }
 
     public static String parseVolumeId(String fileId) {
@@ -326,7 +268,10 @@ public class SeaweedRead {
     }
 
     public static long fileSize(FilerProto.Entry entry) {
-        return Math.max(totalSize(entry.getChunksList()), entry.getAttributes().getFileSize());
+        long chunksSize = totalSize(entry.getChunksList());
+        long attrSize = entry.getAttributes().getFileSize();
+        long finalSize = Math.max(chunksSize, attrSize);
+        return finalSize;
     }
 
     public static long totalSize(List<FilerProto.FileChunk> chunksList) {
@@ -350,7 +295,8 @@ public class SeaweedRead {
         public final byte[] cipherKey;
         public final boolean isCompressed;
 
-        public VisibleInterval(long start, long stop, String fileId, long modifiedTime, long chunkOffset, boolean isFullChunk, byte[] cipherKey, boolean isCompressed) {
+        public VisibleInterval(long start, long stop, String fileId, long modifiedTime, long chunkOffset,
+                boolean isFullChunk, byte[] cipherKey, boolean isCompressed) {
             this.start = start;
             this.stop = stop;
             this.modifiedTime = modifiedTime;
@@ -384,7 +330,8 @@ public class SeaweedRead {
         public final byte[] cipherKey;
         public final boolean isCompressed;
 
-        public ChunkView(String fileId, long offset, long size, long logicOffset, boolean isFullChunk, byte[] cipherKey, boolean isCompressed) {
+        public ChunkView(String fileId, long offset, long size, long logicOffset, boolean isFullChunk, byte[] cipherKey,
+                boolean isCompressed) {
             this.fileId = fileId;
             this.offset = offset;
             this.size = size;

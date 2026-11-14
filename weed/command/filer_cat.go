@@ -3,18 +3,18 @@ package command
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
-	"google.golang.org/grpc"
-	"math"
 	"net/url"
 	"os"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -23,15 +23,15 @@ var (
 
 type FilerCatOptions struct {
 	grpcDialOption grpc.DialOption
-	filerAddress   string
+	filerAddress   pb.ServerAddress
 	filerClient    filer_pb.SeaweedFilerClient
 	output         *string
 }
 
 func (fco *FilerCatOptions) GetLookupFileIdFunction() wdclient.LookupFileIdFunctionType {
-	return func(fileId string) (targetUrls []string, err error) {
+	return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
 		vid := filer.VolumeId(fileId)
-		resp, err := fco.filerClient.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
+		resp, err := fco.filerClient.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
 			VolumeIds: []string{vid},
 		})
 		if err != nil {
@@ -60,7 +60,8 @@ var cmdFilerCat = &Command{
 
 func runFilerCat(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	*filerCat.output = util.ResolvePath(*filerCat.output)
+	util.LoadSecurityConfiguration()
 
 	if len(args) == 0 {
 		return false
@@ -78,7 +79,7 @@ func runFilerCat(cmd *Command, args []string) bool {
 		return false
 	}
 
-	filerCat.filerAddress = filerUrl.Host
+	filerCat.filerAddress = pb.ServerAddress(filerUrl.Host)
 	filerCat.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	dir, name := util.FullPath(urlPath).DirAndName()
@@ -97,20 +98,25 @@ func runFilerCat(cmd *Command, args []string) bool {
 		writer = f
 	}
 
-	pb.WithFilerClient(filerCat.filerAddress, filerCat.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	pb.WithFilerClient(false, util.RandomInt32(), filerCat.filerAddress, filerCat.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.LookupDirectoryEntryRequest{
 			Name:      name,
 			Directory: dir,
 		}
-		respLookupEntry, err := filer_pb.LookupEntry(client, request)
+		respLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, request)
 		if err != nil {
+			return err
+		}
+
+		if len(respLookupEntry.Entry.Content) > 0 {
+			_, err = writer.Write(respLookupEntry.Entry.Content)
 			return err
 		}
 
 		filerCat.filerClient = client
 
-		return filer.StreamContent(&filerCat, writer, respLookupEntry.Entry.Chunks, 0, math.MaxInt64, false)
+		return filer.StreamContent(&filerCat, writer, respLookupEntry.Entry.GetChunks(), 0, int64(filer.FileSize(respLookupEntry.Entry)))
 
 	})
 

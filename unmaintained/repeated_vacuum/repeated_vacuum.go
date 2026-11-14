@@ -1,17 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
-
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 var (
@@ -23,8 +25,9 @@ var (
 
 func main() {
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	genFile(grpcDialOption, 0)
@@ -32,7 +35,7 @@ func main() {
 	go func() {
 		for {
 			println("vacuum threshold", *garbageThreshold)
-			_, _, err := util.Get(fmt.Sprintf("http://%s/vol/vacuum?garbageThreshold=%f", *master, *garbageThreshold))
+			_, _, err := util_http.Get(fmt.Sprintf("http://%s/vol/vacuum?garbageThreshold=%f", pb.ServerAddress(*master).ToHttpAddress(), *garbageThreshold))
 			if err != nil {
 				log.Fatalf("vacuum: %v", err)
 			}
@@ -45,14 +48,14 @@ func main() {
 
 		assignResult, targetUrl := genFile(grpcDialOption, i)
 
-		util.Delete(targetUrl, string(assignResult.Auth))
+		util_http.Delete(targetUrl, string(assignResult.Auth))
 
 	}
 
 }
 
 func genFile(grpcDialOption grpc.DialOption, i int) (*operation.AssignResult, string) {
-	assignResult, err := operation.Assign(*master, grpcDialOption, &operation.VolumeAssignRequest{
+	assignResult, err := operation.Assign(context.Background(), func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(*master) }, grpcDialOption, &operation.VolumeAssignRequest{
 		Count:       1,
 		Replication: *replication,
 	})
@@ -65,7 +68,22 @@ func genFile(grpcDialOption grpc.DialOption, i int) (*operation.AssignResult, st
 
 	targetUrl := fmt.Sprintf("http://%s/%s", assignResult.Url, assignResult.Fid)
 
-	_, err = operation.UploadData(targetUrl, fmt.Sprintf("test%d", i), false, data, false, "bench/test", nil, assignResult.Auth)
+	uploadOption := &operation.UploadOption{
+		UploadUrl:         targetUrl,
+		Filename:          fmt.Sprintf("test%d", i),
+		Cipher:            false,
+		IsInputCompressed: true,
+		MimeType:          "bench/test",
+		PairMap:           nil,
+		Jwt:               assignResult.Auth,
+	}
+
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		log.Fatalf("upload: %v", err)
+	}
+
+	_, err = uploader.UploadData(context.Background(), data, uploadOption)
 	if err != nil {
 		log.Fatalf("upload: %v", err)
 	}

@@ -5,19 +5,23 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
 func (vs *VolumeServer) VolumeTailSender(req *volume_server_pb.VolumeTailSenderRequest, stream volume_server_pb.VolumeServer_VolumeTailSenderServer) error {
-
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
 		return fmt.Errorf("not found volume id %d", req.VolumeId)
+	}
+	if err := v.UnavailableError(); err != nil {
+		return err
 	}
 
 	defer glog.V(1).Infof("tailing volume %d finished", v.Id)
@@ -26,10 +30,13 @@ func (vs *VolumeServer) VolumeTailSender(req *volume_server_pb.VolumeTailSenderR
 	drainingSeconds := req.IdleTimeoutSeconds
 
 	for {
+		if err := v.UnavailableError(); err != nil {
+			return err
+		}
 		lastProcessedTimestampNs, err := sendNeedlesSince(stream, v, lastTimestampNs)
 		if err != nil {
 			glog.Infof("sendNeedlesSince: %v", err)
-			return fmt.Errorf("streamFollow: %v", err)
+			return fmt.Errorf("streamFollow: %w", err)
 		}
 		time.Sleep(2 * time.Second)
 
@@ -63,13 +70,18 @@ func sendNeedlesSince(stream volume_server_pb.VolumeServer_VolumeTailSenderServe
 	// log.Printf("reading ts %d offset %d isLast %v", lastTimestampNs, foundOffset, isLastOne)
 
 	if isLastOne {
+		if err := v.UnavailableError(); err != nil {
+			return 0, err
+		}
 		// need to heart beat to the client to ensure the connection health
-		sendErr := stream.Send(&volume_server_pb.VolumeTailSenderResponse{IsLastChunk: true})
+		sendErr := stream.Send(&volume_server_pb.VolumeTailSenderResponse{IsLastChunk: true, Version: uint32(v.Version())})
 		return lastTimestampNs, sendErr
 	}
 
 	scanner := &VolumeFileScanner4Tailing{
-		stream: stream,
+		stream:  stream,
+		version: uint32(v.Version()),
+		v:       v,
 	}
 
 	err = storage.ScanVolumeFileFrom(v.Version(), v.DataBackend, foundOffset.ToActualOffset(), scanner)
@@ -79,8 +91,17 @@ func sendNeedlesSince(stream volume_server_pb.VolumeServer_VolumeTailSenderServe
 }
 
 func (vs *VolumeServer) VolumeTailReceiver(ctx context.Context, req *volume_server_pb.VolumeTailReceiverRequest) (*volume_server_pb.VolumeTailReceiverResponse, error) {
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return nil, err
+	}
 
 	resp := &volume_server_pb.VolumeTailReceiverResponse{}
+
+	if !vs.AllowUntrustedRemoteEndpoints {
+		if err := validateReplicaTarget(ctx, req.SourceVolumeServer); err != nil {
+			return resp, fmt.Errorf("invalid source volume server %s: %w", req.SourceVolumeServer, err)
+		}
+	}
 
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
@@ -89,10 +110,10 @@ func (vs *VolumeServer) VolumeTailReceiver(ctx context.Context, req *volume_serv
 
 	defer glog.V(1).Infof("receive tailing volume %d finished", v.Id)
 
-	return resp, operation.TailVolumeFromSource(req.SourceVolumeServer, vs.grpcDialOption, v.Id, req.SinceNs, int(req.IdleTimeoutSeconds), func(n *needle.Needle) error {
-		_, err := vs.store.WriteVolumeNeedle(v.Id, n, false)
+	return resp, operation.TailVolumeFromSource(pb.ServerAddress(req.SourceVolumeServer), v.Id, req.SinceNs, int(req.IdleTimeoutSeconds), func(n *needle.Needle) error {
+		_, err := vs.store.WriteVolumeNeedle(v.Id, n, false, false)
 		return err
-	})
+	}, vs.grpcDialOption, vs.guardedGrpcDialOption(req.SourceVolumeServer))
 
 }
 
@@ -100,6 +121,8 @@ func (vs *VolumeServer) VolumeTailReceiver(ctx context.Context, req *volume_serv
 type VolumeFileScanner4Tailing struct {
 	stream                   volume_server_pb.VolumeServer_VolumeTailSenderServer
 	lastProcessedTimestampNs uint64
+	version                  uint32
+	v                        *storage.Volume
 }
 
 func (scanner *VolumeFileScanner4Tailing) VisitSuperBlock(superBlock super_block.SuperBlock) error {
@@ -111,6 +134,9 @@ func (scanner *VolumeFileScanner4Tailing) ReadNeedleBody() bool {
 }
 
 func (scanner *VolumeFileScanner4Tailing) VisitNeedle(n *needle.Needle, offset int64, needleHeader, needleBody []byte) error {
+	if err := scanner.v.UnavailableError(); err != nil {
+		return err
+	}
 	isLastChunk := false
 
 	// need to send body by chunks
@@ -125,6 +151,7 @@ func (scanner *VolumeFileScanner4Tailing) VisitNeedle(n *needle.Needle, offset i
 			NeedleHeader: needleHeader,
 			NeedleBody:   needleBody[i:stopOffset],
 			IsLastChunk:  isLastChunk,
+			Version:      scanner.version,
 		})
 		if sendErr != nil {
 			return sendErr

@@ -3,374 +3,246 @@ package shell
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
-	"math"
-	"sort"
+	"strings"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/erasure_coding"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"google.golang.org/grpc"
+	"github.com/seaweedfs/seaweedfs/weed/ec"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
-func moveMountedShardToEcNode(commandEnv *CommandEnv, existingLocation *EcNode, collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, destinationEcNode *EcNode, applyBalancing bool) (err error) {
+// The EC orchestration logic lives in weed/ec so the shell commands and the
+// maintenance workers share it. The aliases below keep the shell-internal
+// names working for the command files that still use them.
+type DataCenterId = ec.DataCenterId
+type RackId = ec.RackId
+type EcNode = ec.EcNode
 
-	copiedShardIds := []uint32{uint32(shardId)}
+var (
+	ecBalanceAlgorithmDescription = ec.BalanceAlgorithmDescription
+	eachDataNode                  = ec.EachDataNode
+	collectEcVolumeServersByDc    = ec.CollectEcVolumeServersByDc
+	pickBestDiskOnNode            = ec.PickBestDiskOnNode
+	collectVolumeIdToCollection   = ec.CollectVolumeIdToCollection
+	parseVolumeIdsFlag            = ec.ParseVolumeIdsFlag
+	chunkVolumeIds                = ec.ChunkVolumeIds
+)
 
-	if applyBalancing {
-
-		// ask destination node to copy shard and the ecx file from source node, and mount it
-		copiedShardIds, err = oneServerCopyAndMountEcShardsFromSource(commandEnv.option.GrpcDialOption, destinationEcNode, []uint32{uint32(shardId)}, vid, collection, existingLocation.info.Id)
-		if err != nil {
-			return err
-		}
-
-		// unmount the to be deleted shards
-		err = unmountEcShards(commandEnv.option.GrpcDialOption, vid, existingLocation.info.Id, copiedShardIds)
-		if err != nil {
-			return err
-		}
-
-		// ask source node to delete the shard, and maybe the ecx file
-		err = sourceServerDeleteEcShards(commandEnv.option.GrpcDialOption, collection, vid, existingLocation.info.Id, copiedShardIds)
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("moved ec shard %d.%d %s => %s\n", vid, shardId, existingLocation.info.Id, destinationEcNode.info.Id)
-
+// ecEnv adapts a CommandEnv to the cluster access hooks the ec package needs.
+func (ce *CommandEnv) ecEnv() *ec.Env {
+	return &ec.Env{
+		GrpcDialOption: ce.option.GrpcDialOption,
+		FetchTopology: func(delay time.Duration) (*master_pb.TopologyInfo, uint64, error) {
+			return collectTopologyInfo(ce, delay)
+		},
+		GetVolumeLocations: func(vid uint32) ([]wdclient.Location, bool) {
+			return ce.MasterClient.GetLocationsClone(vid)
+		},
+		IsLocked: ce.isLocked,
 	}
-
-	destinationEcNode.addEcVolumeShards(vid, collection, copiedShardIds)
-	existingLocation.deleteEcVolumeShards(vid, copiedShardIds)
-
-	return nil
-
 }
 
-func oneServerCopyAndMountEcShardsFromSource(grpcDialOption grpc.DialOption,
-	targetServer *EcNode, shardIdsToCopy []uint32,
-	volumeId needle.VolumeId, collection string, existingLocation string) (copiedShardIds []uint32, err error) {
+// Overridable functions for testing.
+var getDefaultReplicaPlacement = _getDefaultReplicaPlacement
 
-	fmt.Printf("allocate %d.%v %s => %s\n", volumeId, shardIdsToCopy, existingLocation, targetServer.info.Id)
+func _getDefaultReplicaPlacement(commandEnv *CommandEnv) (*super_block.ReplicaPlacement, error) {
+	var resp *master_pb.GetMasterConfigurationResponse
+	var err error
 
-	err = operation.WithVolumeServerClient(targetServer.info.Id, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-
-		if targetServer.info.Id != existingLocation {
-
-			fmt.Printf("copy %d.%v %s => %s\n", volumeId, shardIdsToCopy, existingLocation, targetServer.info.Id)
-			_, copyErr := volumeServerClient.VolumeEcShardsCopy(context.Background(), &volume_server_pb.VolumeEcShardsCopyRequest{
-				VolumeId:       uint32(volumeId),
-				Collection:     collection,
-				ShardIds:       shardIdsToCopy,
-				CopyEcxFile:    true,
-				CopyEcjFile:    true,
-				CopyVifFile:    true,
-				SourceDataNode: existingLocation,
-			})
-			if copyErr != nil {
-				return fmt.Errorf("copy %d.%v %s => %s : %v\n", volumeId, shardIdsToCopy, existingLocation, targetServer.info.Id, copyErr)
-			}
-		}
-
-		fmt.Printf("mount %d.%v on %s\n", volumeId, shardIdsToCopy, targetServer.info.Id)
-		_, mountErr := volumeServerClient.VolumeEcShardsMount(context.Background(), &volume_server_pb.VolumeEcShardsMountRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
-			ShardIds:   shardIdsToCopy,
-		})
-		if mountErr != nil {
-			return fmt.Errorf("mount %d.%v on %s : %v\n", volumeId, shardIdsToCopy, targetServer.info.Id, mountErr)
-		}
-
-		if targetServer.info.Id != existingLocation {
-			copiedShardIds = shardIdsToCopy
-			glog.V(0).Infof("%s ec volume %d deletes shards %+v", existingLocation, volumeId, copiedShardIds)
-		}
-
-		return nil
+	err = commandEnv.MasterClient.WithClient(context.Background(), false, func(client master_pb.SeaweedClient) error {
+		resp, err = client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
+		return err
 	})
-
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	return
+	return super_block.NewReplicaPlacementFromString(resp.DefaultReplication)
 }
 
-func eachDataNode(topo *master_pb.TopologyInfo, fn func(dc string, rack RackId, dn *master_pb.DataNodeInfo)) {
-	for _, dc := range topo.DataCenterInfos {
-		for _, rack := range dc.RackInfos {
-			for _, dn := range rack.DataNodeInfos {
-				fn(dc.Id, RackId(rack.Id), dn)
-			}
+func parseReplicaPlacementArg(commandEnv *CommandEnv, replicaStr string) (*super_block.ReplicaPlacement, error) {
+	var rp *super_block.ReplicaPlacement
+	var err error
+
+	if replicaStr != "" {
+		rp, err = super_block.NewReplicaPlacementFromString(replicaStr)
+		if err != nil {
+			return rp, err
 		}
-	}
-}
-
-func sortEcNodesByFreeslotsDecending(ecNodes []*EcNode) {
-	sort.Slice(ecNodes, func(i, j int) bool {
-		return ecNodes[i].freeEcSlot > ecNodes[j].freeEcSlot
-	})
-}
-
-func sortEcNodesByFreeslotsAscending(ecNodes []*EcNode) {
-	sort.Slice(ecNodes, func(i, j int) bool {
-		return ecNodes[i].freeEcSlot < ecNodes[j].freeEcSlot
-	})
-}
-
-type CandidateEcNode struct {
-	ecNode     *EcNode
-	shardCount int
-}
-
-// if the index node changed the freeEcSlot, need to keep every EcNode still sorted
-func ensureSortedEcNodes(data []*CandidateEcNode, index int, lessThan func(i, j int) bool) {
-	for i := index - 1; i >= 0; i-- {
-		if lessThan(i+1, i) {
-			swap(data, i, i+1)
-		} else {
-			break
-		}
-	}
-	for i := index + 1; i < len(data); i++ {
-		if lessThan(i, i-1) {
-			swap(data, i, i-1)
-		} else {
-			break
-		}
-	}
-}
-
-func swap(data []*CandidateEcNode, i, j int) {
-	t := data[i]
-	data[i] = data[j]
-	data[j] = t
-}
-
-func countShards(ecShardInfos []*master_pb.VolumeEcShardInformationMessage) (count int) {
-	for _, ecShardInfo := range ecShardInfos {
-		shardBits := erasure_coding.ShardBits(ecShardInfo.EcIndexBits)
-		count += shardBits.ShardIdCount()
-	}
-	return
-}
-
-func countFreeShardSlots(dn *master_pb.DataNodeInfo, diskType types.DiskType) (count int) {
-	if dn.DiskInfos == nil {
-		return 0
-	}
-	diskInfo := dn.DiskInfos[string(diskType)]
-	if diskInfo == nil {
-		return 0
-	}
-	return int(diskInfo.MaxVolumeCount-diskInfo.ActiveVolumeCount)*erasure_coding.DataShardsCount - countShards(diskInfo.EcShardInfos)
-}
-
-type RackId string
-type EcNodeId string
-
-type EcNode struct {
-	info       *master_pb.DataNodeInfo
-	dc         string
-	rack       RackId
-	freeEcSlot int
-}
-
-func (ecNode *EcNode) localShardIdCount(vid uint32) int {
-	for _, diskInfo := range ecNode.info.DiskInfos {
-		for _, ecShardInfo := range diskInfo.EcShardInfos {
-			if vid == ecShardInfo.Id {
-				shardBits := erasure_coding.ShardBits(ecShardInfo.EcIndexBits)
-				return shardBits.ShardIdCount()
-			}
-		}
-	}
-	return 0
-}
-
-type EcRack struct {
-	ecNodes    map[EcNodeId]*EcNode
-	freeEcSlot int
-}
-
-func collectEcNodes(commandEnv *CommandEnv, selectedDataCenter string) (ecNodes []*EcNode, totalFreeEcSlots int, err error) {
-
-	// list all possible locations
-	// collect topology information
-	topologyInfo, _, err := collectTopologyInfo(commandEnv)
-	if err != nil {
-		return
-	}
-
-	// find out all volume servers with one slot left.
-	ecNodes, totalFreeEcSlots = collectEcVolumeServersByDc(topologyInfo, selectedDataCenter)
-
-	sortEcNodesByFreeslotsDecending(ecNodes)
-
-	return
-}
-
-func collectEcVolumeServersByDc(topo *master_pb.TopologyInfo, selectedDataCenter string) (ecNodes []*EcNode, totalFreeEcSlots int) {
-	eachDataNode(topo, func(dc string, rack RackId, dn *master_pb.DataNodeInfo) {
-		if selectedDataCenter != "" && selectedDataCenter != dc {
-			return
-		}
-
-		freeEcSlots := countFreeShardSlots(dn, types.HardDriveType)
-		ecNodes = append(ecNodes, &EcNode{
-			info:       dn,
-			dc:         dc,
-			rack:       rack,
-			freeEcSlot: int(freeEcSlots),
-		})
-		totalFreeEcSlots += freeEcSlots
-	})
-	return
-}
-
-func sourceServerDeleteEcShards(grpcDialOption grpc.DialOption, collection string, volumeId needle.VolumeId, sourceLocation string, toBeDeletedShardIds []uint32) error {
-
-	fmt.Printf("delete %d.%v from %s\n", volumeId, toBeDeletedShardIds, sourceLocation)
-
-	return operation.WithVolumeServerClient(sourceLocation, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-		_, deleteErr := volumeServerClient.VolumeEcShardsDelete(context.Background(), &volume_server_pb.VolumeEcShardsDeleteRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
-			ShardIds:   toBeDeletedShardIds,
-		})
-		return deleteErr
-	})
-
-}
-
-func unmountEcShards(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, sourceLocation string, toBeUnmountedhardIds []uint32) error {
-
-	fmt.Printf("unmount %d.%v from %s\n", volumeId, toBeUnmountedhardIds, sourceLocation)
-
-	return operation.WithVolumeServerClient(sourceLocation, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-		_, deleteErr := volumeServerClient.VolumeEcShardsUnmount(context.Background(), &volume_server_pb.VolumeEcShardsUnmountRequest{
-			VolumeId: uint32(volumeId),
-			ShardIds: toBeUnmountedhardIds,
-		})
-		return deleteErr
-	})
-}
-
-func mountEcShards(grpcDialOption grpc.DialOption, collection string, volumeId needle.VolumeId, sourceLocation string, toBeMountedhardIds []uint32) error {
-
-	fmt.Printf("mount %d.%v on %s\n", volumeId, toBeMountedhardIds, sourceLocation)
-
-	return operation.WithVolumeServerClient(sourceLocation, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-		_, mountErr := volumeServerClient.VolumeEcShardsMount(context.Background(), &volume_server_pb.VolumeEcShardsMountRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
-			ShardIds:   toBeMountedhardIds,
-		})
-		return mountErr
-	})
-}
-
-func divide(total, n int) float64 {
-	return float64(total) / float64(n)
-}
-
-func ceilDivide(total, n int) int {
-	return int(math.Ceil(float64(total) / float64(n)))
-}
-
-func findEcVolumeShards(ecNode *EcNode, vid needle.VolumeId) erasure_coding.ShardBits {
-
-	if diskInfo, found := ecNode.info.DiskInfos[string(types.HardDriveType)]; found {
-		for _, shardInfo := range diskInfo.EcShardInfos {
-			if needle.VolumeId(shardInfo.Id) == vid {
-				return erasure_coding.ShardBits(shardInfo.EcIndexBits)
-			}
-		}
-	}
-
-	return 0
-}
-
-func (ecNode *EcNode) addEcVolumeShards(vid needle.VolumeId, collection string, shardIds []uint32) *EcNode {
-
-	foundVolume := false
-	diskInfo, found := ecNode.info.DiskInfos[string(types.HardDriveType)]
-	if found {
-		for _, shardInfo := range diskInfo.EcShardInfos {
-			if needle.VolumeId(shardInfo.Id) == vid {
-				oldShardBits := erasure_coding.ShardBits(shardInfo.EcIndexBits)
-				newShardBits := oldShardBits
-				for _, shardId := range shardIds {
-					newShardBits = newShardBits.AddShardId(erasure_coding.ShardId(shardId))
-				}
-				shardInfo.EcIndexBits = uint32(newShardBits)
-				ecNode.freeEcSlot -= newShardBits.ShardIdCount() - oldShardBits.ShardIdCount()
-				foundVolume = true
-				break
-			}
-		}
+		glog.V(1).Infof("using replica placement %q for EC volumes\n", rp.String())
 	} else {
-		diskInfo = &master_pb.DiskInfo{
-			Type: string(types.HardDriveType),
+		// No replica placement argument provided, resolve from master default settings.
+		rp, err = getDefaultReplicaPlacement(commandEnv)
+		if err != nil {
+			return rp, err
 		}
-		ecNode.info.DiskInfos[string(types.HardDriveType)] = diskInfo
+		glog.V(1).Infof("using master default replica placement %q for EC volumes\n", rp.String())
 	}
 
-	if !foundVolume {
-		var newShardBits erasure_coding.ShardBits
-		for _, shardId := range shardIds {
-			newShardBits = newShardBits.AddShardId(erasure_coding.ShardId(shardId))
-		}
-		diskInfo.EcShardInfos = append(diskInfo.EcShardInfos, &master_pb.VolumeEcShardInformationMessage{
-			Id:          uint32(vid),
-			Collection:  collection,
-			EcIndexBits: uint32(newShardBits),
-			DiskType:    string(types.HardDriveType),
-		})
-		ecNode.freeEcSlot -= len(shardIds)
-	}
-
-	return ecNode
+	return rp, nil
 }
 
-func (ecNode *EcNode) deleteEcVolumeShards(vid needle.VolumeId, shardIds []uint32) *EcNode {
+func collectTopologyInfo(commandEnv *CommandEnv, delayBeforeCollecting time.Duration) (topoInfo *master_pb.TopologyInfo, volumeSizeLimitMb uint64, err error) {
+	if delayBeforeCollecting > 0 {
+		time.Sleep(delayBeforeCollecting)
+	}
+	return fetchTopologyInfo(context.Background(), commandEnv, &master_pb.VolumeListRequest{})
+}
 
-	if diskInfo, found := ecNode.info.DiskInfos[string(types.HardDriveType)]; found {
-		for _, shardInfo := range diskInfo.EcShardInfos {
-			if needle.VolumeId(shardInfo.Id) == vid {
-				oldShardBits := erasure_coding.ShardBits(shardInfo.EcIndexBits)
-				newShardBits := oldShardBits
-				for _, shardId := range shardIds {
-					newShardBits = newShardBits.RemoveShardId(erasure_coding.ShardId(shardId))
-				}
-				shardInfo.EcIndexBits = uint32(newShardBits)
-				ecNode.freeEcSlot -= newShardBits.ShardIdCount() - oldShardBits.ShardIdCount()
-			}
+func fetchTopologyInfo(ctx context.Context, commandEnv *CommandEnv, request *master_pb.VolumeListRequest) (topoInfo *master_pb.TopologyInfo, volumeSizeLimitMb uint64, err error) {
+	var resp *master_pb.VolumeListResponse
+	err = commandEnv.MasterClient.WithClient(ctx, false, func(client master_pb.SeaweedClient) error {
+		resp, err = pb.CollectVolumeList(ctx, client, request)
+		return err
+	})
+	if err != nil {
+		return
+	}
+
+	return resp.TopologyInfo, resp.VolumeSizeLimitMb, nil
+}
+
+func collectDataNodes(commandEnv *CommandEnv, delayBeforeCollecting time.Duration) ([]*master_pb.DataNodeInfo, error) {
+	topo, _, err := collectTopologyInfo(commandEnv, delayBeforeCollecting)
+	if err != nil {
+		return nil, err
+	}
+	return topologyDataNodes(topo), nil
+}
+
+func topologyDataNodes(topo *master_pb.TopologyInfo) []*master_pb.DataNodeInfo {
+	dataNodes := []*master_pb.DataNodeInfo{}
+	for _, dci := range topo.GetDataCenterInfos() {
+		for _, r := range dci.GetRackInfos() {
+			dataNodes = append(dataNodes, r.GetDataNodeInfos()...)
 		}
 	}
-
-	return ecNode
+	return dataNodes
 }
 
-func groupByCount(data []*EcNode, identifierFn func(*EcNode) (id string, count int)) map[string]int {
-	countMap := make(map[string]int)
-	for _, d := range data {
-		id, count := identifierFn(d)
-		countMap[id] += count
+// collectVolumeServerAddresses resolves nodes with volumeServerAddresses from
+// a topology-only listing. An explicit node list bounds the lookup and is used
+// as given when the topology is unavailable, so it still works while the
+// master is down.
+func collectVolumeServerAddresses(commandEnv *CommandEnv, nodes string) ([]pb.ServerAddress, error) {
+	if nodes != "" && everyNodeNamesGrpcPort(nodes) {
+		return volumeServerAddresses(nil, nodes), nil
 	}
-	return countMap
+	ctx := context.Background()
+	if nodes != "" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+	topo, _, err := fetchTopologyInfo(ctx, commandEnv, &master_pb.VolumeListRequest{TopologyOnly: true})
+	if err != nil {
+		if nodes == "" {
+			return nil, err
+		}
+		glog.V(0).Infof("dialing volume servers as given, topology unavailable: %v", err)
+	}
+	return volumeServerAddresses(topologyDataNodes(topo), nodes), nil
 }
 
-func groupBy(data []*EcNode, identifierFn func(*EcNode) (id string)) map[string][]*EcNode {
-	groupMap := make(map[string][]*EcNode)
-	for _, d := range data {
-		id := identifierFn(d)
-		groupMap[id] = append(groupMap[id], d)
+func everyNodeNamesGrpcPort(nodes string) bool {
+	for _, node := range strings.Split(nodes, ",") {
+		node = strings.TrimSpace(node)
+		if node == "" {
+			continue
+		}
+		portsSepIndex := strings.LastIndex(node, ":")
+		if portsSepIndex < 0 || !strings.Contains(node[portsSepIndex+1:], ".") {
+			return false
+		}
 	}
-	return groupMap
+	return true
+}
+
+// volumeServerAddresses returns the comma-separated nodes, or every data node
+// when nodes is empty, dialing each registered server on its gRPC port unless
+// the node names one.
+func volumeServerAddresses(dataNodes []*master_pb.DataNodeInfo, nodes string) []pb.ServerAddress {
+	registered := make(map[string]pb.ServerAddress, len(dataNodes))
+	all := make([]pb.ServerAddress, 0, len(dataNodes))
+	for _, dn := range dataNodes {
+		addr := pb.NewServerAddressFromDataNode(dn)
+		registered[addr.ToHttpAddress()] = addr
+		all = append(all, addr)
+	}
+	if nodes == "" {
+		return all
+	}
+	addrs := []pb.ServerAddress{}
+	for _, node := range strings.Split(nodes, ",") {
+		node = strings.TrimSpace(node)
+		if node == "" {
+			continue
+		}
+		if addr, found := registered[node]; found {
+			addrs = append(addrs, addr)
+		} else {
+			addrs = append(addrs, pb.ServerAddress(node))
+		}
+	}
+	return addrs
+}
+
+func collectEcNodesForDC(commandEnv *CommandEnv, selectedDataCenter string, diskType types.DiskType) (ecNodes []*EcNode, totalFreeEcSlots int, err error) {
+	return ec.CollectEcNodesForDC(commandEnv.ecEnv(), selectedDataCenter, diskType)
+}
+
+func collectEcNodes(commandEnv *CommandEnv, diskType types.DiskType) (ecNodes []*EcNode, totalFreeEcSlots int, err error) {
+	return ec.CollectEcNodes(commandEnv.ecEnv(), diskType)
+}
+
+func moveMountedShardToEcNode(commandEnv *CommandEnv, existingLocation *EcNode, collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, destinationEcNode *EcNode, destDiskId uint32, applyBalancing bool, diskType types.DiskType) (err error) {
+	return ec.MoveMountedShardToEcNode(commandEnv.ecEnv(), existingLocation, collection, vid, shardId, destinationEcNode, destDiskId, applyBalancing, diskType)
+}
+
+// EcBalance balances EC shards across the cluster; see ec.EcBalance for the
+// excludeNodes and volumeIds semantics.
+func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplicaPlacement *super_block.ReplicaPlacement, diskType types.DiskType, maxParallelization int, ioBytePerSecond int64, applyBalancing bool, excludeNodes map[pb.ServerAddress]struct{}, volumeIds []needle.VolumeId) (err error) {
+	return ec.EcBalance(commandEnv.ecEnv(), collections, dc, ecReplicaPlacement, diskType, maxParallelization, ioBytePerSecond, applyBalancing, excludeNodes, volumeIds, nil)
+}
+
+// compileCollectionPattern compiles the -collection value shared by commands
+// where an empty value means the collection with no name: a comma-separated
+// list of collection names, wildcards, and regex patterns, or CollectionDefault
+// for the empty-named collection.
+func compileCollectionPattern(pattern string) (*wildcard.CollectionMatcher, error) {
+	if strings.TrimSpace(pattern) == "" {
+		pattern = CollectionDefault
+	}
+	return wildcard.CompileCollectionMatcher(pattern)
+}
+
+// resolveEcCollections expands the ec commands' -collection value into
+// collection names. An empty value means the empty-named collection, the same
+// as CollectionDefault. Literal names pass through even when the master does
+// not list them — the listing only contains collections with registered
+// volumes, and ec.rebuild exists to bring back a collection whose volumes all
+// lost their index. Wildcard and regex entries resolve against the listing.
+func resolveEcCollections(commandEnv *CommandEnv, filter string) (collections []string, err error) {
+	if strings.TrimSpace(filter) == "" {
+		filter = CollectionDefault
+	}
+	names, err := ListCollectionNames(commandEnv, false, true)
+	if err != nil {
+		return nil, err
+	}
+	collections, err = wildcard.ExpandCollectionFilter(filter, names)
+	if err != nil {
+		return nil, fmt.Errorf("invalid collection pattern %q: %w", filter, err)
+	}
+	if len(collections) == 0 {
+		return nil, fmt.Errorf("no collections match %q", filter)
+	}
+	return collections, nil
 }

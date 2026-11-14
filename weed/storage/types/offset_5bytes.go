@@ -1,4 +1,4 @@
-// +build 5BytesOffset
+//go:build 5BytesOffset
 
 package types
 

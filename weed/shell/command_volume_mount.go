@@ -5,9 +5,10 @@ import (
 	"flag"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"google.golang.org/grpc"
 )
 
@@ -32,20 +33,24 @@ func (c *commandVolumeMount) Help() string {
 `
 }
 
-func (c *commandVolumeMount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+func (c *commandVolumeMount) HasTag(CommandTag) bool {
+	return false
+}
 
-	if err = commandEnv.confirmIsLocked(); err != nil {
-		return
-	}
+func (c *commandVolumeMount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	volMountCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	volumeIdInt := volMountCommand.Int("volumeId", 0, "the volume id")
 	nodeStr := volMountCommand.String("node", "", "the volume server <host>:<port>")
 	if err = volMountCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 
-	sourceVolumeServer := *nodeStr
+	if err = commandEnv.confirmIsLocked(args); err != nil {
+		return
+	}
+
+	sourceVolumeServer := pb.ServerAddress(*nodeStr)
 
 	volumeId := needle.VolumeId(*volumeIdInt)
 
@@ -53,8 +58,8 @@ func (c *commandVolumeMount) Do(args []string, commandEnv *CommandEnv, writer io
 
 }
 
-func mountVolume(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, sourceVolumeServer string) (err error) {
-	return operation.WithVolumeServerClient(sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+func mountVolume(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, sourceVolumeServer pb.ServerAddress) (err error) {
+	return operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		_, mountErr := volumeServerClient.VolumeMount(context.Background(), &volume_server_pb.VolumeMountRequest{
 			VolumeId: uint32(volumeId),
 		})

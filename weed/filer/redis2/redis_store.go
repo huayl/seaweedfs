@@ -1,9 +1,13 @@
 package redis2
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/go-redis/redis/v8"
+	"crypto/tls"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/redis_conf"
+	"github.com/seaweedfs/seaweedfs/weed/filer/redis_tls"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -19,20 +23,33 @@ func (store *Redis2Store) GetName() string {
 }
 
 func (store *Redis2Store) Initialize(configuration util.Configuration, prefix string) (err error) {
+	tlsConfig, err := redis_tls.Config(configuration, prefix)
+	if err != nil {
+		return err
+	}
 	return store.initialize(
 		configuration.GetString(prefix+"address"),
+		configuration.GetString(prefix+"username"),
 		configuration.GetString(prefix+"password"),
 		configuration.GetInt(prefix+"database"),
+		configuration.GetString(prefix+"keyPrefix"),
 		configuration.GetStringSlice(prefix+"superLargeDirectories"),
+		tlsConfig,
+		redis_conf.Read(configuration, prefix),
 	)
 }
 
-func (store *Redis2Store) initialize(hostPort string, password string, database int, superLargeDirectories []string) (err error) {
-	store.Client = redis.NewClient(&redis.Options{
-		Addr:     hostPort,
-		Password: password,
-		DB:       database,
-	})
+func (store *Redis2Store) initialize(hostPort string, username string, password string, database int, keyPrefix string, superLargeDirectories []string, tlsConfig *tls.Config, settings redis_conf.Settings) (err error) {
+	options := &redis.Options{
+		Addr:      hostPort,
+		Username:  username,
+		Password:  password,
+		DB:        database,
+		TLSConfig: tlsConfig,
+	}
+	settings.ApplyTo(options)
+	store.Client = redis.NewClient(options)
+	store.keyPrefix = keyPrefix
 	store.loadSuperLargeDirectories(superLargeDirectories)
 	return
 }

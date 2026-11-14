@@ -1,6 +1,4 @@
-// +build !linux
-// +build !darwin
-// +build !freebsd
+//go:build !linux && !darwin && !freebsd && !windows
 
 package command
 

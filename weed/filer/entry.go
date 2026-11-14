@@ -2,28 +2,31 @@ package filer
 
 import (
 	"os"
+	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Attr struct {
 	Mtime         time.Time   // time of last modification
 	Crtime        time.Time   // time of creation (OS X only)
+	Ctime         time.Time   // time of last inode change
+	Atime         time.Time   // time of last access
 	Mode          os.FileMode // file mode
 	Uid           uint32      // owner uid
 	Gid           uint32      // group gid
 	Mime          string      // mime type
-	Replication   string      // replication
-	Collection    string      // collection name
 	TtlSec        int32       // ttl in seconds
-	DiskType      string
 	UserName      string
 	GroupNames    []string
 	SymlinkTarget string
 	Md5           []byte
 	FileSize      uint64
+	Rdev          uint32
+	Inode         uint64
 }
 
 func (attr Attr) IsDirectory() bool {
@@ -39,13 +42,19 @@ type Entry struct {
 	// the following is for files
 	Chunks []*filer_pb.FileChunk `json:"chunks,omitempty"`
 
-	HardLinkId      HardLinkId
-	HardLinkCounter int32
-	Content         []byte
+	HardLinkId         HardLinkId
+	HardLinkCounter    int32
+	Content            []byte
+	Remote             *filer_pb.RemoteEntry
+	Quota              int64
+	WORMEnforcedAtTsNs int64
+	// CommitTsNs is the meta log event timestamp of the mutation that
+	// produced this version. Zero for pre-field versions; they order by mtime.
+	CommitTsNs int64
 }
 
 func (entry *Entry) Size() uint64 {
-	return maxUint64(maxUint64(TotalSize(entry.Chunks), entry.FileSize), uint64(len(entry.Content)))
+	return maxUint64(maxUint64(TotalSize(entry.GetChunks()), entry.FileSize), uint64(len(entry.Content)))
 }
 
 func (entry *Entry) Timestamp() time.Time {
@@ -56,20 +65,70 @@ func (entry *Entry) Timestamp() time.Time {
 	}
 }
 
+func (entry *Entry) ShallowClone() *Entry {
+	if entry == nil {
+		return nil
+	}
+	newEntry := &Entry{}
+	newEntry.FullPath = entry.FullPath
+	newEntry.Attr = entry.Attr
+	newEntry.Chunks = entry.Chunks
+	newEntry.Extended = entry.Extended
+	newEntry.HardLinkId = entry.HardLinkId
+	newEntry.HardLinkCounter = entry.HardLinkCounter
+	newEntry.Content = entry.Content
+	newEntry.Remote = entry.Remote
+	newEntry.Quota = entry.Quota
+	newEntry.WORMEnforcedAtTsNs = entry.WORMEnforcedAtTsNs
+	newEntry.CommitTsNs = entry.CommitTsNs
+
+	return newEntry
+}
+
 func (entry *Entry) ToProtoEntry() *filer_pb.Entry {
 	if entry == nil {
 		return nil
 	}
-	return &filer_pb.Entry{
-		Name:            entry.FullPath.Name(),
-		IsDirectory:     entry.IsDirectory(),
-		Attributes:      EntryAttributeToPb(entry),
-		Chunks:          entry.Chunks,
-		Extended:        entry.Extended,
-		HardLinkId:      entry.HardLinkId,
-		HardLinkCounter: entry.HardLinkCounter,
-		Content:         entry.Content,
+	message := &filer_pb.Entry{}
+	message.Name = entry.FullPath.Name()
+	entry.ToExistingProtoEntry(message)
+	return message
+}
+
+func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
+	if entry == nil {
+		return
 	}
+	message.IsDirectory = entry.IsDirectory()
+	// Reuse pre-allocated attributes if available, otherwise allocate
+	if message.Attributes != nil {
+		EntryAttributeToExistingPb(entry, message.Attributes)
+	} else {
+		message.Attributes = EntryAttributeToPb(entry)
+	}
+	message.Chunks = entry.GetChunks()
+	message.Extended = entry.Extended
+	message.HardLinkId = entry.HardLinkId
+	message.HardLinkCounter = entry.HardLinkCounter
+	message.Content = entry.Content
+	message.RemoteEntry = entry.Remote
+	message.Quota = entry.Quota
+	message.WormEnforcedAtTsNs = entry.WORMEnforcedAtTsNs
+	message.CommitTsNs = entry.CommitTsNs
+}
+
+func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
+	fsEntry.Attr = PbToEntryAttribute(message.Attributes)
+	fsEntry.Chunks = message.Chunks
+	fsEntry.Extended = message.Extended
+	fsEntry.HardLinkId = HardLinkId(message.HardLinkId)
+	fsEntry.HardLinkCounter = message.HardLinkCounter
+	fsEntry.Content = message.Content
+	fsEntry.Remote = message.RemoteEntry
+	fsEntry.Quota = message.Quota
+	fsEntry.FileSize = FileSize(message)
+	fsEntry.WORMEnforcedAtTsNs = message.WormEnforcedAtTsNs
+	fsEntry.CommitTsNs = message.CommitTsNs
 }
 
 func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {
@@ -83,26 +142,15 @@ func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {
 	}
 }
 
-func (entry *Entry) Clone() *Entry {
-	return &Entry{
-		FullPath:        entry.FullPath,
-		Attr:            entry.Attr,
-		Chunks:          entry.Chunks,
-		Extended:        entry.Extended,
-		HardLinkId:      entry.HardLinkId,
-		HardLinkCounter: entry.HardLinkCounter,
-	}
+func (entry *Entry) GetChunks() []*filer_pb.FileChunk {
+	return entry.Chunks
 }
 
 func FromPbEntry(dir string, entry *filer_pb.Entry) *Entry {
-	return &Entry{
-		FullPath:        util.NewFullPath(dir, entry.Name),
-		Attr:            PbToEntryAttribute(entry.Attributes),
-		Chunks:          entry.Chunks,
-		HardLinkId:      HardLinkId(entry.HardLinkId),
-		HardLinkCounter: entry.HardLinkCounter,
-		Content:         entry.Content,
-	}
+	t := &Entry{}
+	t.FullPath = util.NewFullPath(dir, entry.Name)
+	FromPbEntryToExistingEntry(entry, t)
+	return t
 }
 
 func maxUint64(x, y uint64) uint64 {
@@ -110,4 +158,82 @@ func maxUint64(x, y uint64) uint64 {
 		return x
 	}
 	return y
+}
+
+func (entry *Entry) IsExpireS3Enabled() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.SeaweedFSExpiresS3]
+	}
+	return exist
+}
+
+func (entry *Entry) isS3Entry() bool {
+	if entry.Extended == nil {
+		return false
+	}
+
+	if _, found := entry.Extended[s3_constants.ExtAmzOwnerKey]; found {
+		return true
+	}
+
+	if _, found := entry.Extended[s3_constants.ExtETagKey]; found {
+		return true
+	}
+
+	for key := range entry.Extended {
+		if strings.HasPrefix(key, s3_constants.ExtAmzPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ApplyStorageTtl stamps the TTL the entry's data was placed with. Remote
+// entries never expire locally; the remote storage owns their lifecycle.
+func (entry *Entry) ApplyStorageTtl(ttlSec int32) {
+	if entry.Remote != nil {
+		ttlSec = 0
+	}
+	entry.TtlSec = ttlSec
+	entry.ApplyS3ExpiryMetadata()
+}
+
+func (entry *Entry) ApplyS3ExpiryMetadata() {
+	if entry.TtlSec == 0 {
+		return
+	}
+
+	if _, found := entry.Extended[s3_constants.SeaweedFSExpiresS3]; found {
+		return
+	}
+
+	// The s3 expiry path skips versioned entries, so stamping one would drop its
+	// expiry entirely instead of moving it onto mtime.
+	if entry.IsS3Versioning() {
+		return
+	}
+
+	if !entry.isS3Entry() {
+		return
+	}
+
+	entry.Extended[s3_constants.SeaweedFSExpiresS3] = []byte("true")
+
+	return
+}
+
+func (entry *Entry) IsS3Versioning() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.ExtVersionIdKey]
+	}
+	return exist
+}
+
+func (entry *Entry) GetS3ExpireTime() (expireTime time.Time) {
+	if entry.Mtime.IsZero() {
+		expireTime = entry.Crtime
+	} else {
+		expireTime = entry.Mtime
+	}
+	return expireTime.Add(time.Duration(entry.TtlSec) * time.Second)
 }

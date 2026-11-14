@@ -35,6 +35,16 @@ func TestTTLReadWrite(t *testing.T) {
 		t.Errorf("50d ttl:%v", ttl)
 	}
 
+	ttl, _ = ReadTTL("365d")
+	if ttl.Minutes() != 365*24*60 {
+		t.Errorf("365d ttl:%v", ttl)
+	}
+
+	ttl, _ = ReadTTL("730d")
+	if ttl.Minutes() != 730*24*60 {
+		t.Errorf("730d ttl:%v", ttl)
+	}
+
 	ttl, _ = ReadTTL("5w")
 	if ttl.Minutes() != 5*7*24*60 {
 		t.Errorf("5w ttl:%v", ttl)
@@ -62,4 +72,27 @@ func TestTTLReadWrite(t *testing.T) {
 		t.Errorf("ttl:%v ttl3:%v", ttl, ttl3)
 	}
 
+}
+
+func TestLoadTTLIsInterned(t *testing.T) {
+	for count := 0; count < 256; count++ {
+		for unit := 0; unit < 256; unit++ {
+			got := LoadTTLFromBytes([]byte{byte(count), byte(unit)})
+			if got.Count != byte(count) || got.Unit != byte(unit) {
+				if count == 0 && unit == 0 {
+					continue
+				}
+				t.Fatalf("count %d unit %d: got %+v", count, unit, got)
+			}
+			if fromUint32 := LoadTTLFromUint32(got.ToUint32()); count != 0 && *fromUint32 != *got {
+				t.Fatalf("count %d unit %d: uint32 round trip gave %+v", count, unit, fromUint32)
+			}
+		}
+	}
+	if LoadTTLFromBytes([]byte{3, Day}) != LoadTTLFromBytes([]byte{3, Day}) {
+		t.Error("expected repeated loads of the same stored ttl to share one value")
+	}
+	if LoadTTLFromBytes([]byte{0, 0}) != EMPTY_TTL {
+		t.Error("expected a zero ttl to stay EMPTY_TTL")
+	}
 }

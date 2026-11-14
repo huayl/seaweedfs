@@ -1,20 +1,20 @@
 package weed_server
 
 import (
-	"context"
 	"net/http"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // add or replace one file Seaweed- prefixed attributes
 // curl -X PUT -H "Seaweed-Name1: value1" http://localhost:8888/path/to/a/file?tagging
 func (fs *FilerServer) PutTaggingHandler(w http.ResponseWriter, r *http.Request) {
 
-	ctx := context.Background()
+	ctx := r.Context()
 
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/") {
@@ -36,16 +36,16 @@ func (fs *FilerServer) PutTaggingHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	for header, values := range r.Header {
-		if strings.HasPrefix(header, needle.PairNamePrefix) {
+		if strings.HasPrefix(header, needle.PairNamePrefix) && header != filer.ExtRemoteRenameSourceKey {
 			for _, value := range values {
 				existingEntry.Extended[header] = []byte(value)
 			}
 		}
 	}
 
-	if dbErr := fs.filer.CreateEntry(ctx, existingEntry, false, false, nil); dbErr != nil {
-		glog.V(0).Infof("failing to update %s tagging : %v", path, dbErr)
-		writeJsonError(w, r, http.StatusInternalServerError, err)
+	if dbErr := fs.filer.CreateEntry(ctx, existingEntry, nil, false, false, nil, false, fs.filer.MaxFilenameLength); dbErr != nil {
+		glog.V(0).InfofCtx(ctx, "failing to update %s tagging : %v", path, dbErr)
+		writeJsonError(w, r, http.StatusInternalServerError, dbErr)
 		return
 	}
 
@@ -57,7 +57,7 @@ func (fs *FilerServer) PutTaggingHandler(w http.ResponseWriter, r *http.Request)
 // curl -X DELETE http://localhost:8888/path/to/a/file?tagging
 func (fs *FilerServer) DeleteTaggingHandler(w http.ResponseWriter, r *http.Request) {
 
-	ctx := context.Background()
+	ctx := r.Context()
 
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/") {
@@ -78,11 +78,29 @@ func (fs *FilerServer) DeleteTaggingHandler(w http.ResponseWriter, r *http.Reque
 		existingEntry.Extended = make(map[string][]byte)
 	}
 
+	// parse out tags to be deleted
+	toDelete := strings.Split(r.URL.Query().Get("tagging"), ",")
+	deletions := make(map[string]struct{})
+	for _, deletion := range toDelete {
+		if deletion != "" {
+			deletions[deletion] = struct{}{}
+		}
+	}
+
+	// delete all tags or specific tags
 	hasDeletion := false
 	for header, _ := range existingEntry.Extended {
-		if strings.HasPrefix(header, needle.PairNamePrefix) {
-			delete(existingEntry.Extended, header)
-			hasDeletion = true
+		if strings.HasPrefix(header, needle.PairNamePrefix) && header != filer.ExtRemoteRenameSourceKey {
+			if len(deletions) == 0 {
+				delete(existingEntry.Extended, header)
+				hasDeletion = true
+			} else {
+				tag := header[len(needle.PairNamePrefix):]
+				if _, found := deletions[tag]; found {
+					delete(existingEntry.Extended, header)
+					hasDeletion = true
+				}
+			}
 		}
 	}
 
@@ -91,9 +109,9 @@ func (fs *FilerServer) DeleteTaggingHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if dbErr := fs.filer.CreateEntry(ctx, existingEntry, false, false, nil); dbErr != nil {
-		glog.V(0).Infof("failing to delete %s tagging : %v", path, dbErr)
-		writeJsonError(w, r, http.StatusInternalServerError, err)
+	if dbErr := fs.filer.CreateEntry(ctx, existingEntry, nil, false, false, nil, false, fs.filer.MaxFilenameLength); dbErr != nil {
+		glog.V(0).InfofCtx(ctx, "failing to delete %s tagging : %v", path, dbErr)
+		writeJsonError(w, r, http.StatusInternalServerError, dbErr)
 		return
 	}
 

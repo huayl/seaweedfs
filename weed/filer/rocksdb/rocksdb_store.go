@@ -1,3 +1,4 @@
+//go:build rocksdb
 // +build rocksdb
 
 package rocksdb
@@ -10,12 +11,12 @@ import (
 	"io"
 	"os"
 
-	"github.com/tecbot/gorocksdb"
+	gorocksdb "github.com/linxGnu/grocksdb"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -24,18 +25,21 @@ func init() {
 
 type options struct {
 	opt *gorocksdb.Options
+	bto *gorocksdb.BlockBasedTableOptions
 	ro  *gorocksdb.ReadOptions
 	wo  *gorocksdb.WriteOptions
 }
 
 func (opt *options) init() {
 	opt.opt = gorocksdb.NewDefaultOptions()
+	opt.bto = gorocksdb.NewDefaultBlockBasedTableOptions()
 	opt.ro = gorocksdb.NewDefaultReadOptions()
 	opt.wo = gorocksdb.NewDefaultWriteOptions()
 }
 
 func (opt *options) close() {
 	opt.opt.Destroy()
+	opt.bto.Destroy()
 	opt.ro.Destroy()
 	opt.wo.Destroy()
 }
@@ -69,6 +73,11 @@ func (store *RocksDBStore) initialize(dir string) (err error) {
 	store.opt.SetCompactionFilter(NewTTLFilter())
 	// store.opt.SetMaxBackgroundCompactions(2)
 
+	// https://github.com/tecbot/gorocksdb/issues/132
+	store.bto.SetFilterPolicy(gorocksdb.NewBloomFilterFull(8))
+	store.opt.SetBlockBasedTableFactory(store.bto)
+	// store.opt.EnableStatistics()
+
 	store.db, err = gorocksdb.OpenDb(store.opt, dir)
 
 	return
@@ -99,7 +108,7 @@ func (store *RocksDBStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
 	}
 
-	// println("saved", entry.FullPath, "chunks", len(entry.Chunks))
+	// println("saved", entry.FullPath, "chunks", len(entry.GetChunks()))
 
 	return nil
 }
@@ -114,7 +123,7 @@ func (store *RocksDBStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 	key := genKey(dir, name)
 	data, err := store.db.Get(store.ro, key)
 
-	if data == nil {
+	if data == nil || !data.Exists() {
 		return nil, filer_pb.ErrNotFound
 	}
 	defer data.Free()
@@ -131,7 +140,7 @@ func (store *RocksDBStore) FindEntry(ctx context.Context, fullpath weed_util.Ful
 		return entry, fmt.Errorf("decode %s : %v", entry.FullPath, err)
 	}
 
-	// println("read", entry.FullPath, "chunks", len(entry.Chunks), "data", len(data), string(data))
+	// println("read", entry.FullPath, "chunks", len(entry.GetChunks()), "data", len(data), string(data))
 
 	return entry, nil
 }
@@ -160,7 +169,7 @@ func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 
 	iter := store.db.NewIterator(ro)
 	defer iter.Close()
-	err = enumerate(iter, directoryPrefix, nil, false, -1, func(key, value []byte) bool {
+	err = enumerate(iter, directoryPrefix, nil, false, -1, "", func(key, value []byte) bool {
 		batch.Delete(key)
 		return true
 	})
@@ -177,23 +186,16 @@ func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 	return nil
 }
 
-func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey bool, limit int64, fn func(key, value []byte) bool) (err error) {
+func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey bool, limit int64, startFileName string, fn func(key, value []byte) bool) (err error) {
 
 	if len(lastKey) == 0 {
 		iter.Seek(prefix)
 	} else {
 		iter.Seek(lastKey)
-		if !includeLastKey {
-			if iter.Valid() {
-				if bytes.Equal(iter.Key().Data(), lastKey) {
-					iter.Next()
-				}
-			}
-		}
 	}
 
 	i := int64(0)
-	for ; iter.Valid(); iter.Next() {
+	for iter.Valid() {
 
 		if limit > 0 {
 			i++
@@ -208,16 +210,27 @@ func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey 
 			break
 		}
 
+		fileName := getNameFromKey(key)
+		if fileName == "" {
+			iter.Next()
+			continue
+		}
+		if fileName == startFileName && !includeLastKey {
+			iter.Next()
+			continue
+		}
+
 		ret := fn(key, iter.Value().Data())
 
 		if !ret {
 			break
 		}
 
+		iter.Next()
 	}
 
 	if err := iter.Err(); err != nil {
-		return fmt.Errorf("prefix scan iterator: %v", err)
+		return fmt.Errorf("prefix scan iterator: %w", err)
 	}
 	return nil
 }
@@ -230,7 +243,7 @@ func (store *RocksDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 
 	directoryPrefix := genDirectoryKeyPrefix(dirPath, prefix)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart = genDirectoryKeyPrefix(dirPath, startFileName)
 	}
 
@@ -238,9 +251,10 @@ func (store *RocksDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 	defer ro.Destroy()
 	ro.SetFillCache(false)
 
+	var callbackErr error
 	iter := store.db.NewIterator(ro)
 	defer iter.Close()
-	err = enumerate(iter, directoryPrefix, lastFileStart, includeStartFile, limit, func(key, value []byte) bool {
+	err = enumerate(iter, directoryPrefix, lastFileStart, includeStartFile, limit, startFileName, func(key, value []byte) bool {
 		fileName := getNameFromKey(key)
 		if fileName == "" {
 			return true
@@ -250,17 +264,34 @@ func (store *RocksDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		}
 		lastFileName = fileName
 
-		// println("list", entry.FullPath, "chunks", len(entry.Chunks))
+		// println("list", entry.FullPath, "chunks", len(entry.GetChunks()))
 		if decodeErr := entry.DecodeAttributesAndChunks(value); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			return false
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			glog.V(0).InfofCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", fileName, resEachEntryFuncErr)
+			callbackErr = resEachEntryFuncErr
 			return false
 		}
+
+		if !resEachEntryFunc {
+			return false
+		}
+
 		return true
 	})
+
+	if callbackErr != nil {
+		return lastFileName, fmt.Errorf(
+			"failed to process eachEntryFunc for dir %q, entry %q: %w",
+			dirPath, lastFileName, callbackErr,
+		)
+	}
+
 	if err != nil {
 		return lastFileName, fmt.Errorf("prefix list %s : %v", dirPath, err)
 	}

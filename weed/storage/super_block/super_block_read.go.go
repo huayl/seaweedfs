@@ -2,20 +2,24 @@ package super_block
 
 import (
 	"fmt"
+	"io"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/storage/backend"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // ReadSuperBlock reads from data file and load it into volume's super block
 func ReadSuperBlock(datBackend backend.BackendStorageFile) (superBlock SuperBlock, err error) {
 
 	header := make([]byte, SuperBlockSize)
-	if _, e := datBackend.ReadAt(header, 0); e != nil {
+	if n, e := datBackend.ReadAt(header, 0); n != SuperBlockSize {
+		if e == nil {
+			e = io.ErrUnexpectedEOF
+		}
 		err = fmt.Errorf("cannot read volume %s super block: %v", datBackend.Name(), e)
 		return
 	}
@@ -32,10 +36,17 @@ func ReadSuperBlock(datBackend backend.BackendStorageFile) (superBlock SuperBloc
 	if superBlock.ExtraSize > 0 {
 		// read more
 		extraData := make([]byte, int(superBlock.ExtraSize))
+		if n, e := datBackend.ReadAt(extraData, SuperBlockSize); n != len(extraData) {
+			if e == nil {
+				e = io.ErrUnexpectedEOF
+			}
+			err = fmt.Errorf("cannot read volume %s super block extra: %v", datBackend.Name(), e)
+			return
+		}
 		superBlock.Extra = &master_pb.SuperBlockExtra{}
 		err = proto.Unmarshal(extraData, superBlock.Extra)
 		if err != nil {
-			err = fmt.Errorf("cannot read volume %s super block extra: %v", datBackend.Name(), err)
+			err = fmt.Errorf("cannot unmarshal volume %s super block extra: %v", datBackend.Name(), err)
 			return
 		}
 	}
